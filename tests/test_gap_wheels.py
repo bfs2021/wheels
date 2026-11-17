@@ -1118,18 +1118,21 @@ class Elf(unittest.TestCase):
         self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled}), GLIBC_POLICY), ["libgomp-24e2ab19.so.1.0.0"])
         braced = elf(["libc.so.6", "libgomp-24e2ab19.so.1.0.0"], rpath="${ORIGIN}/../pkg.libs")
         self.assertEqual(gap_wheels.missing_libs(zipped({ext: braced, **libs}), GLIBC_POLICY), [])
-        # The bundled library has no RUNPATH: its own dependency isn't found from pkg.libs.
+        # The bundled library has no RUNPATH: glibc doesn't look in its own folder, so its dependency isn't found.
         no_runpath = {**libs, "pkg.libs/libgomp-24e2ab19.so.1.0.0": elf(["libc.so.6", "libnuma-1a2b.so.1"])}
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled, **no_runpath}), GLIBC_POLICY), [])  # own folder
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled, **no_runpath}), GLIBC_POLICY),
+                         ["libnuma-1a2b.so.1"])  # fmt: skip
         elsewhere = {"pkg.libs/libgomp-24e2ab19.so.1.0.0": elf(["libc.so.6", "libnuma-1a2b.so.1"]),
                      "other.libs/libnuma-1a2b.so.1": numa}  # fmt: skip
         self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled, **elsewhere}), GLIBC_POLICY), ["libnuma-1a2b.so.1"])
-        # A file of that name elsewhere in the wheel doesn't count: not in the extension's folder nor on its RUNPATH.
+        # Without a RUNPATH a file of that name anywhere in the wheel doesn't count, even beside the extension: the
+        # loader doesn't look there (a package preloading it with ctypes would work, but isn't published).
         plain = elf(["libc.so.6", "libfoo.so.1"])
-        for where in ("pkg-1.0.data/data/lib/libfoo.so.1", "other/libfoo.so.1", "pkg.libs/libfoo.so.1"):
+        for where in ("pkg-1.0.data/data/lib/libfoo.so.1", "other/libfoo.so.1", "pkg.libs/libfoo.so.1", "pkg/libfoo.so.1"):
             with self.subTest(where):
                 self.assertEqual(gap_wheels.missing_libs(zipped({ext: plain, where: numa}), GLIBC_POLICY), ["libfoo.so.1"])
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: plain, "pkg/libfoo.so.1": numa}), GLIBC_POLICY), [])
+        beside = elf(["libc.so.6", "libfoo.so.1"], runpath="$ORIGIN")
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: beside, "pkg/libfoo.so.1": numa}), GLIBC_POLICY), [])
         # A RUNPATH reaches only into the wheel: not above it, not into another install scheme, not by absolute path.
         for runpath, where in (("$ORIGIN/../..", "libfoo.so.1"), ("/usr/lib", "usr/lib/libfoo.so.1"),
                                ("$ORIGIN/../pkg-1.0.data/data/lib", "pkg-1.0.data/data/lib/libfoo.so.1"),

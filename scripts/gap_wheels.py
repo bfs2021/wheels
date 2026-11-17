@@ -1190,13 +1190,13 @@ def installed(member: str) -> tuple[str, str]:
 
 
 def search_dirs(member: str, runpath: list[str]) -> list[tuple[str, str]]:
-    """The installed folders a wheel's ELF file finds its libraries in: its own folder (not where glibc looks, but a
-    package that loads its libraries first, with ctypes, works there, and the install test catches one that doesn't),
-    and each RUNPATH entry that is $ORIGIN or under it and stays inside its scheme. Other entries (/usr/lib, $LIB,
-    a relative path) can't point into the wheel, so they don't count."""
+    """The installed folders in the wheel where glibc's loader finds a wheel ELF file's libraries: each RUNPATH (or
+    RPATH) entry that is $ORIGIN or under it and stays inside its scheme. Not the file's own folder, which the loader
+    doesn't search: a wheel that works only because the package preloads a library (with ctypes) isn't published.
+    Other entries (/usr/lib, $LIB, a relative path) can't point into the wheel, so they don't count."""
     scheme, path = installed(member)
     here = posixpath.dirname(path)
-    dirs = [(scheme, here)]
+    dirs = []
     for entry in runpath:
         for origin in ("$ORIGIN", "${ORIGIN}"):
             if entry == origin or entry.startswith(origin + "/"):
@@ -1216,8 +1216,8 @@ def search_dirs(member: str, runpath: list[str]) -> list[tuple[str, str]]:
 def missing_libs(wheel: bytes, plat: str) -> list[str] | None:
     """What the wheel's ELF files (every shared object, by name, and any other file that is ELF) need that a system of
     the platform tag `plat` may not have: libraries that are neither on its policy's list (LINUX_POLICIES) nor in the
-    wheel where that file finds them (search_dirs: auditwheel bundles them in <dist>.libs/ and points RUNPATH there
-    with $ORIGIN), and for glibc symbol versions the policy doesn't allow (GLIBC_2.34 for manylinux_2_28). Empty when
+    wheel where the loader finds them from that file (search_dirs: auditwheel bundles them in <dist>.libs/ and points
+    RUNPATH there with $ORIGIN), and for glibc symbol versions the policy doesn't allow (GLIBC_2.34 for manylinux_2_28). Empty when
     it needs nothing else; None if a file can't be read (elf_needs) or there are too many or too much to check."""
     policy = LINUX_POLICIES[plat]
     with zipfile.ZipFile(io.BytesIO(wheel)) as z:
