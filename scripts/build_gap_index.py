@@ -191,12 +191,35 @@ def wheel_tags(filename: str) -> tuple[str, str, set[tuple[str, str, str]]] | No
 
 
 CPYTHON = re.compile(r"cp(\d)(\d+)", re.ASCII)
+LINUX = re.compile(r"(manylinux|musllinux)_(\d{1,3})_(\d{1,3})_([a-z0-9_]{1,20})", re.ASCII)
+LEGACY_MANYLINUX = {"manylinux1": (2, 5), "manylinux2010": (2, 12), "manylinux2014": (2, 17)}  # PEP 600's aliases
+
+
+def linux_platform(plat: str) -> tuple[str, int, int, str] | None:
+    """(manylinux or musllinux, the libc's major and minor version, architecture) of a PEP 600 or PEP 656 platform tag,
+    or of a legacy manylinux one (manylinux2014_x86_64 is manylinux_2_17_x86_64); None for anything else."""
+    if m := LINUX.fullmatch(plat):
+        return m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+    for alias, (major, minor) in LEGACY_MANYLINUX.items():
+        if plat.startswith(alias + "_") and re.fullmatch(r"[a-z0-9_]{1,20}", arch := plat[len(alias) + 1 :]):
+            return "manylinux", major, minor, arch
+    return None
+
+
+def platform_covers(theirs: str, ours: str) -> bool:
+    """Whether every system that takes platform tag `ours` takes `theirs`: the same tag, or on Linux the same libc and
+    architecture with an older or equal libc version (a glibc 2.28 system installs manylinux_2_17 wheels too)."""
+    if theirs == ours:
+        return True
+    t, o = linux_platform(theirs), linux_platform(ours)
+    return t is not None and o is not None and (t[0], t[3]) == (o[0], o[3]) and t[1:3] <= o[1:3]
 
 
 def covers(theirs: tuple[str, str, str], ours: tuple[str, str, str]) -> bool:
     """Whether a wheel tagged `theirs` installs everywhere one tagged `ours` (a CPython wheel, cpXY-cpXY[t]-PLAT) does.
-    Only cases that are certain count: the same tag, abi3 from an older or equal CPython for a non-free-threaded ABI,
-    and pure Python wheels. Anything else keeps our wheel."""
+    Only cases that are certain count: the same Python and ABI on a platform that covers ours (the same tag, or an
+    older manylinux or musllinux of the same architecture), abi3 from an older or equal CPython for a
+    non-free-threaded ABI, and pure Python wheels. Anything else keeps our wheel."""
     if theirs == ours:
         return True
     py, abi, plat = ours
@@ -207,8 +230,10 @@ def covers(theirs: tuple[str, str, str], ours: tuple[str, str, str]) -> bool:
     tpy, tabi, tplat = theirs
     if tabi == "none" and tplat == "any":
         return tpy in (f"py{major}", f"py{major}{minor}", py)
-    if tplat != plat:
+    if not platform_covers(tplat, plat):
         return False
+    if (tpy, tabi) == (py, abi):
+        return True
     if tabi == "abi3" and abi == py:
         tm = CPYTHON.fullmatch(tpy)
         return tm is not None and int(tm.group(1)) == major and int(tm.group(2)) <= minor
@@ -284,7 +309,7 @@ def human_page(by_project: dict[str, list[dict]], gone: dict[str, str] | None = 
         if rows
         else '        <p class="note">No wheels published yet.</p>\n'
     )
-    summary = "Windows on ARM wheels that PyPI doesn't have yet, for Python 3.14. Each one is built twice and only goes up if both builds match."
+    summary = "Wheels PyPI doesn't have yet, for Windows and Linux on new Pythons (3.14, 3.14t, 3.15). Each one is built twice and only goes up if both builds match."
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -301,7 +326,7 @@ def human_page(by_project: dict[str, list[dict]], gone: dict[str, str] | None = 
   <header class="wrap">
     <p class="eyebrow"><a href="/tracker/">wheelgap tracker</a> · <a href="https://github.com/wheelgap/wheels">source and threat model</a></p>
     <h1>Gap wheels</h1>
-    <p class="lede">Some popular Python packages don't have a wheel on PyPI for Windows on ARM yet, mostly on Python 3.14. When that happens pip tries to build them from source, which needs Rust or a C compiler and often fails. These are the missing wheels. {count} so far.</p>
+    <p class="lede">Some popular Python packages don't have a wheel on PyPI yet for Windows on ARM, for free-threaded Python 3.14t, for Alpine Linux on ARM or for Python 3.15. When that happens pip tries to build them from source, which needs Rust or a C compiler and often fails. These are the missing wheels. {count} so far.</p>
   </header>
   <main class="wrap">
     <section>
@@ -327,11 +352,13 @@ tokenizers = {{ index = "wheelgap" }}</code></pre>
         <li>Built from the source file PyPI has for that release. Its hash is checked against PyPI's. Build tools come from PyPI too.</li>
         <li>Built twice, in two separate GitHub Actions runs. It only goes up if the two builds come out byte for byte the same.</li>
         <li>Tagged for the one Python and platform it was built and tested on, nothing wider. It can't rely on a DLL your machine might not have.</li>
+        <li>On Linux, built in a pinned manylinux_2_28 or Alpine image and repaired there with a pinned auditwheel, which bundles the libraries it needs. It only goes up if every other library it needs is on that platform's standard list (and, for glibc, nothing newer than glibc 2.28), and it's install-tested in a minimal container, not on a build machine.</li>
         <li>Installed and imported on a fresh machine before it goes up. On free-threaded Python the GIL has to stay off. This checks that it works, it's not a security check.</li>
         <li>pip checks each file's hash when it downloads it. You can also check where a file came from with <code>gh attestation verify FILE.whl -R wheelgap/wheels</code>.</li>
         <li>Every wheel, its source hash and both of its build runs are listed in <a href="data/gap-wheels.json">gap-wheels.json</a>.</li>
       </ul>
-      <p>One thing to know: a wheel here is only as safe as the source it was built from. Installing the package the normal way runs the same code. Only packages with an OSI-approved licence (or the PSF licence Python uses) go up. Windows only for now, Linux needs more work first.</p>
+      <p>One thing to know: a wheel here is only as safe as the source it was built from. Installing the package the normal way runs the same code. Only packages with an OSI-approved licence (or the PSF licence Python uses) go up.</p>
+      <p>The platforms: Windows on ARM for Python 3.14 and 3.14t, Windows x64 for Python 3.15, Linux x86_64 (glibc 2.28 or newer: <code>manylinux_2_28</code>) for Python 3.14t and 3.15, and Alpine Linux on ARM (<code>musllinux_1_2</code>) for Python 3.14. Linux wheels go up only once a maintainer approves a publish run that includes them; the table below shows which are here.</p>
     </section>
     <section>
       <h2>If it's your package</h2>

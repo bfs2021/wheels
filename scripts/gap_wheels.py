@@ -1,4 +1,4 @@
-"""Gap wheels: verify which of the build lab's clean builds are reproducible and install, and publish the Windows ones.
+"""Gap wheels: verify which of the build lab's clean builds are reproducible and install, and publish them.
 
     python3 scripts/gap_wheels.py plan data/builds.json [--max N] [--only a,b] --github-output FILE
     python scripts/gap_wheels.py build --name NAME --version VERSION --target TARGET --attempt 1|2 --runner R --out FILE
@@ -691,23 +691,31 @@ def cmd_collect(args: argparse.Namespace) -> int:
 # --- stage, install-test and publish: making verified wheels public ---------------------------------------------------
 #
 # stage (trusted, in the coordinator): for each verified wheel, take the file from its build run's `wheel` artifact and
-#   keep it only if its sha256 is the one both builds reported, it is for a Windows target, PyPI names an
-#   OSI-approved licence for the release, and the project hasn't opted out.
+#   keep it only if its sha256 is the one both builds reported, it carries exactly its target's one tag, it needs
+#   nothing a user's system may lack (on Windows a DLL, read from its PE imports; on Linux a library or a glibc symbol
+#   version outside the manylinux_2_28 or musllinux_1_2 policy, read from its ELF files), PyPI names an OSI-approved
+#   licence for the release, and the project hasn't opted out. It only parses the wheel's bytes, never runs them.
 # install-test (untrusted: it imports package code): on a fresh runner of the target, install each staged wheel
-#   into a new venv and import it as the build lab does. Its answers only decide whether a byte-verified wheel is
-#   worth publishing; a package's code could lie about them, but never change which bytes are published.
+#   into a new venv and import it as the build lab does; a Linux wheel in a minimal container of its libc with the
+#   target's exact CPython (LINUX_TESTS), not on the runner itself. Its answers only decide whether a byte-verified
+#   wheel is worth publishing; a package's code could lie about them, but never change which bytes are published.
 # publish (trusted, never runs package code): re-check every file against the sha256 stage passed it, then add it to
 #   data/gap-wheels.json; the workflow attests the files, uploads them to the `gap-wheels` release and deploys the
 #   index the site builds from that file (scripts/build_gap_index.py).
 
 # The one tag a published wheel may carry for its target: the Python and platform its builds and install test ran on,
-# nothing wider. Not abi3 or py3-none (other Pythons would take it untested), not a compressed tag set (win_arm64.
-# win_amd64 would put an ARM64 .pyd on x64), and not Linux: `pip wheel` tags it linux_*, which pip installs on any
-# libc and version, so those need auditwheel's manylinux/musllinux tag first.
+# nothing wider. Not abi3 or py3-none (other Pythons would take it untested), and not a compressed tag set (win_arm64.
+# win_amd64 would put an ARM64 .pyd on x64; manylinux_2_28_x86_64.manylinux2014_x86_64 would claim a glibc it wasn't
+# checked against). On Linux it's the tag auditwheel repairs to in the target's pinned image (build_lab.TARGETS'
+# `plat`: manylinux_2_28 in the manylinux_2_28 image, musllinux_1_2 in Alpine), never linux_*, the tag `pip wheel`
+# gives, which pip installs on any libc and version.
 PUBLISH_TAGS = {
     "3.14 win-arm64": "cp314-cp314-win_arm64",
     "3.14t win-arm64": "cp314-cp314t-win_arm64",
     "3.15 win-amd64": "cp315-cp315-win_amd64",
+    "3.14t linux-x86_64": "cp314-cp314t-manylinux_2_28_x86_64",
+    "3.14 musl-aarch64": "cp314-cp314-musllinux_1_2_aarch64",
+    "3.15 linux-x86_64": "cp315-cp315-manylinux_2_28_x86_64",
 }
 # DLLs every Windows machine with that CPython has: the interpreter's, the VC++ runtime Python's installer ships
 # (vcruntime140 only, not msvcp140 or vcomp140), the Universal CRT and core system DLLs. An extension importing any
@@ -723,6 +731,79 @@ SYSTEM_DLLS = frozenset({
     "imm32.dll", "propsys.dll", "dwmapi.dll", "uxtheme.dll", "opengl32.dll", "d3d11.dll", "dxgi.dll",
 })  # fmt: skip
 SYSTEM_DLL = re.compile(r"api-ms-win-[a-z0-9-]+\.dll|ext-ms-win-[a-z0-9-]+\.dll|python3[0-9]{1,2}t?\.dll", re.ASCII)
+# The Linux counterpart, by the platform tag a target repairs to: the libraries every system of that tag has (PEP 600,
+# PEP 656) and, for glibc, the symbol versions they may be asked for, by prefix (GLIBC_2.28 is "GLIBC" "2.28"). Copied
+# from auditwheel's own policy, src/auditwheel/policy/manylinux-policy.json ("manylinux_2_28", x86_64) and
+# musllinux-policy.json ("musllinux_1_2", whose "libc.so" auditwheel reads as the arch's libc.musl-*.so.1), at
+# auditwheel 6.8.2, the version REPAIR_TOOLS pins. Bump them together. As in auditwheel, a symbol version whose prefix
+# the policy doesn't list (OPENSSL_3.0.0 from a bundled library) isn't checked, the dynamic loader (ld-linux-*) is
+# always there, and musl has no symbol versioning, so only its library list applies. Not re-checked here: auditwheel's
+# blacklist of zlib's internal symbols (the repair in the build refuses those).
+LINUX_POLICIES: dict[str, dict] = {
+    "manylinux_2_28_x86_64": {
+        "machine": 62,  # EM_X86_64
+        "libs": frozenset({
+            "libatomic.so.1", "libgcc_s.so.1", "libstdc++.so.6", "libm.so.6", "libmvec.so.1", "libanl.so.1",
+            "libdl.so.2", "librt.so.1", "libc.so.6", "libnsl.so.1", "libutil.so.1", "libpthread.so.0", "libX11.so.6",
+            "libXext.so.6", "libXrender.so.1", "libICE.so.6", "libSM.so.6", "libGL.so.1", "libgobject-2.0.so.0",
+            "libgthread-2.0.so.0", "libglib-2.0.so.0", "libresolv.so.2", "libexpat.so.1", "libz.so.1",
+            "ld-linux-x86-64.so.2",  # the dynamic loader: not in the policy's list, but auditwheel always allows it
+        }),
+        "versions": {
+            "CXXABI": frozenset({"1.3", "1.3.1", "1.3.2", "1.3.3", "1.3.4", "1.3.5", "1.3.6", "1.3.7", "1.3.8",
+                                 "1.3.9", "1.3.10", "1.3.11", "FLOAT128", "TM_1"}),
+            "GCC": frozenset({"3.0", "3.3", "3.3.1", "3.4", "3.4.2", "3.4.4", "4.0.0", "4.2.0", "4.3.0", "4.7.0",
+                              "4.8.0", "7.0.0"}),
+            "GLIBC": frozenset({"2.2.5", "2.2.6", "2.3", "2.3.2", "2.3.3", "2.3.4", "2.4", "2.5", "2.6", "2.7", "2.8",
+                                "2.9", "2.10", "2.11", "2.12", "2.13", "2.14", "2.15", "2.16", "2.17", "2.18", "2.22",
+                                "2.23", "2.24", "2.25", "2.26", "2.27", "2.28"}),
+            "GLIBCXX": frozenset({"3.4", "3.4.1", "3.4.2", "3.4.3", "3.4.4", "3.4.5", "3.4.6", "3.4.7", "3.4.8",
+                                  "3.4.9", "3.4.10", "3.4.11", "3.4.12", "3.4.13", "3.4.14", "3.4.15", "3.4.16",
+                                  "3.4.17", "3.4.18", "3.4.19", "3.4.20", "3.4.21", "3.4.22", "3.4.23", "3.4.24"}),
+            "LIBATOMIC": frozenset({"1.0", "1.1", "1.2"}),
+            "ZLIB": frozenset({"1.2.0", "1.2.0.2", "1.2.0.8", "1.2.2", "1.2.2.3", "1.2.2.4", "1.2.3.3", "1.2.3.4",
+                               "1.2.3.5", "1.2.5.1", "1.2.5.2", "1.2.7.1", "1.2.9"}),
+        },
+    },
+    "musllinux_1_2_aarch64": {
+        "machine": 183,  # EM_AARCH64
+        "libs": frozenset({"libc.musl-aarch64.so.1", "libz.so.1"}),
+        "versions": {},
+    },
+}  # fmt: skip
+# Where a Linux target's staged wheels are install-tested: `docker run` of a minimal image of its libc, pinned by
+# digest, that has the target's exact CPython and little else, on a GitHub runner of its architecture. Not on the
+# runner itself (GitHub's image has hundreds of libraries a user's system may lack) and not in the build image
+# (manylinux's has compilers and -devel libraries). Each is `image`, the `interpreter` in it for the target and, for a
+# CPython the image doesn't have, a python-build-standalone archive (`python_url`, `python_sha256`) that the job checks
+# against that sha256 on the runner, unpacks and mounts read-only at /opt/python.
+# - 3.14 musl: the official python:3.14-alpine (CPython 3.14.10 on Alpine's musl), the image the build uses.
+# - 3.15 glibc: the official python:3.15-slim-trixie (CPython 3.15.2 on Debian 13's slim base, glibc 2.41).
+# - 3.14t glibc: no official image has a free-threaded CPython, and Debian's own python3 is neither 3.14t nor
+#   relocatable. So Debian 13's slim base image with python-build-standalone's 3.14t: the relocatable CPython builds uv
+#   installs (Astral), self-contained apart from glibc, pinned by release and sha256 (from that release's SHA256SUMS).
+#   Fetched by the runner, not in the container, so no curl or CA store is added to the image (pip brings certifi).
+# The digests are each multi-arch image index (Docker Hub, 2026-11-17).
+LINUX_TESTS: dict[str, dict[str, str]] = {
+    "3.14t linux-x86_64": {
+        "runner": "ubuntu-latest",
+        "image": "debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2",
+        "interpreter": "/opt/python/bin/python3.14t",
+        "python_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261110/"
+        "cpython-3.14.10%2B20261110-x86_64-unknown-linux-gnu-freethreaded-install_only.tar.gz",
+        "python_sha256": "5cdd0e655393fa3ac2c361665fcc6bf518f075ac8d82dfa1d74c278a1aa59e7c",
+    },
+    "3.14 musl-aarch64": {
+        "runner": "ubuntu-24.04-arm",
+        "image": "python:3.14-alpine@sha256:5862d971d1f0ae26b258cefa4e893556b1d3aba81bd2ff30888704ad378bab67",
+        "interpreter": "python",
+    },
+    "3.15 linux-x86_64": {
+        "runner": "ubuntu-latest",
+        "image": "python:3.15-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928",
+        "interpreter": "python",
+    },
+}
 # OSI-approved licences by SPDX id (the common ones on PyPI); an expression passes only if every id is one of these.
 OSI = frozenset(s.lower() for s in (
     "0BSD", "AFL-3.0", "AGPL-3.0-only", "AGPL-3.0-or-later", "Apache-1.1", "Apache-2.0", "APSL-2.0", "Artistic-2.0",
@@ -947,6 +1028,157 @@ def missing_dlls(wheel: bytes) -> list[str] | None:
     return sorted(missing)
 
 
+def elf_needs(data: bytes, machine: int) -> tuple[set[str], set[str]] | None:
+    """(the libraries a 64-bit little-endian ELF file for `machine` needs, its DT_NEEDED entries, and the symbol
+    versions it needs from them, from its version-needs table, .gnu.version_r: "GLIBC_2.17", "GLIBCXX_3.4.21"); None
+    if it can't be read. Read as the dynamic loader reads it, from the program headers and the dynamic segment, not
+    the section headers. Versions needed from the loader itself (ld-linux-*) are left out, as auditwheel does. A file
+    with no dynamic segment (statically linked, or an object file) needs nothing. Reads untrusted bytes, so every
+    offset is bounds-checked and anything odd is None (the wheel isn't published): another class, byte order or
+    machine, a table that runs off the file or its segment, a name that isn't ASCII."""
+
+    def u16(o: int) -> int:
+        if o < 0 or o + 2 > len(data):
+            raise ValueError
+        return int.from_bytes(data[o : o + 2], "little")
+
+    def u32(o: int) -> int:
+        if o < 0 or o + 4 > len(data):
+            raise ValueError
+        return int.from_bytes(data[o : o + 4], "little")
+
+    def u64(o: int) -> int:
+        if o < 0 or o + 8 > len(data):
+            raise ValueError
+        return int.from_bytes(data[o : o + 8], "little")
+
+    try:
+        if data[:7] != b"\x7fELF\x02\x01\x01":  # ELFCLASS64, ELFDATA2LSB, EV_CURRENT
+            return None
+        if u16(16) not in (1, 2, 3) or u16(18) != machine:  # ET_REL, ET_EXEC or ET_DYN, for the target's machine
+            return None
+        phoff, phentsize, phnum = u64(0x20), u16(0x36), u16(0x38)
+        if phnum and (phentsize != 56 or phnum > 256):  # 256 is far more than a linker writes
+            return None
+        loads, dynamic = [], None
+        for i in range(phnum):
+            p = phoff + 56 * i
+            kind = u32(p)
+            if kind == 1:  # PT_LOAD: (vaddr, size in the file, file offset)
+                loads.append((u64(p + 16), u64(p + 32), u64(p + 8)))
+            elif kind == 2:  # PT_DYNAMIC: (vaddr, size)
+                if dynamic is not None:
+                    return None
+                dynamic = (u64(p + 16), u64(p + 32))
+        if dynamic is None:
+            return set(), set()
+
+        def offset(vaddr: int, size: int) -> int:
+            """The file offset of `size` bytes at `vaddr`, all inside one loaded segment's bytes in the file."""
+            for va, filesz, off in loads:
+                if va <= vaddr and vaddr + size <= va + filesz and off + (vaddr - va) + size <= len(data):
+                    return off + (vaddr - va)
+            raise ValueError
+
+        if dynamic[1] % 16 or dynamic[1] // 16 > 4096:
+            return None
+        start = offset(dynamic[0], dynamic[1])
+        needed, tags = [], {}
+        for n in range(dynamic[1] // 16):
+            tag, value = u64(start + 16 * n), u64(start + 16 * n + 8)
+            if tag == 0:  # DT_NULL
+                break
+            if tag == 1:  # DT_NEEDED
+                needed.append(value)
+            elif tag in (5, 10, 0x6FFFFFFE, 0x6FFFFFFF):  # DT_STRTAB, DT_STRSZ, DT_VERNEED, DT_VERNEEDNUM
+                if tag in tags:
+                    return None
+                tags[tag] = value
+        else:
+            return None  # no DT_NULL
+        if not needed and 0x6FFFFFFE not in tags:
+            return set(), set()
+        if 5 not in tags or 10 not in tags:
+            return None
+        strsz = tags[10]
+        strtab = offset(tags[5], strsz)
+
+        def string(o: int) -> str:
+            if o >= strsz:
+                raise ValueError
+            end = data.find(b"\0", strtab + o, strtab + min(strsz, o + 256))
+            if end < 0:
+                raise ValueError
+            return data[strtab + o : end].decode("ascii")
+
+        versions: set[str] = set()
+        if 0x6FFFFFFE in tags:
+            count = tags.get(0x6FFFFFFF)
+            if count is None or count > 4096:
+                return None
+            v, seen = offset(tags[0x6FFFFFFE], 16), 0
+            for n in range(count):  # Elf64_Verneed: version, count, file, first aux, next (offsets from this one)
+                if u16(v) != 1:
+                    return None
+                aux_count, file, a, step = u16(v + 2), string(u32(v + 4)), v + u32(v + 8), u32(v + 12)
+                for m in range(aux_count):  # Elf64_Vernaux: hash, flags, other, name, next
+                    seen += 1
+                    if seen > 10_000:
+                        return None
+                    name = string(u32(a + 8))
+                    if not file.startswith("ld-linux"):
+                        versions.add(name)
+                    if m < aux_count - 1:
+                        if not u32(a + 12):
+                            return None
+                        a += u32(a + 12)
+                if n < count - 1:
+                    if not step:
+                        return None
+                    v += step
+        return {string(o) for o in needed}, versions
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+SHARED_OBJECT = re.compile(r"[^/]*\.so(?:\.[0-9]+)*", re.ASCII)  # _ext.cpython-314t-x86_64-linux-gnu.so, libz-1a2b.so.1
+
+
+def missing_libs(wheel: bytes, plat: str) -> list[str] | None:
+    """What the wheel's ELF files (every shared object, by name, and any other file that is ELF) need that a system of
+    the platform tag `plat` may not have: libraries that are neither on its policy's list (LINUX_POLICIES) nor a file
+    in the wheel (auditwheel bundles them in <dist>.libs/ and points RUNPATH there, so a name anywhere in the wheel
+    counts), and for glibc symbol versions the policy doesn't allow (GLIBC_2.34 for manylinux_2_28). Empty when it
+    needs nothing else; None if a file can't be read (elf_needs) or there are too many to check."""
+    policy = LINUX_POLICIES[plat]
+    with zipfile.ZipFile(io.BytesIO(wheel)) as z:
+        files = [i for i in z.infolist() if not i.is_dir()]
+        names = {i.filename.rpartition("/")[2] for i in files}
+        binaries = []
+        for i in files:
+            if SHARED_OBJECT.fullmatch(i.filename.rpartition("/")[2]):
+                binaries.append(i)
+            else:
+                with z.open(i) as f:
+                    if f.read(4) == b"\x7fELF":
+                        binaries.append(i)
+            if len(binaries) > 500:
+                return None
+        missing: set[str] = set()
+        for info in binaries:
+            data = bounded(z, info.filename, 200_000_000)
+            needs = elf_needs(data, policy["machine"]) if data is not None else None
+            if needs is None:
+                return None
+            libs, versions = needs
+            missing |= {n for n in libs if n not in policy["libs"] and n not in names}
+            for v in versions:
+                prefix, _, version = v.partition("_")
+                if prefix in policy["versions"] and version not in policy["versions"][prefix]:
+                    missing.add(v)
+    return sorted(missing)
+
+
 def unwrap_wheel(archive: bytes, filename: str, digest: str) -> bytes | None:
     """The wheel from a `wheel` artifact zip: exactly one member, named `filename`, whose sha256 is `digest`."""
     try:
@@ -982,7 +1214,9 @@ def stage_reason(wheel: dict, info: dict | None, optout: set[str]) -> str | None
     if not ASSET.fullmatch(wheel["wheel"]):
         return "its filename can't be a release asset name"
     if not tag_ok(wheel["wheel"], wheel["target"]):
-        return f"not tagged exactly {PUBLISH_TAGS.get(wheel['target'], 'a publishable tag')} (a linux_* wheel needs auditwheel first)"
+        unrepaired = wheel["wheel"].rpartition("-")[2].startswith("linux_")
+        return (f"not tagged exactly {PUBLISH_TAGS.get(wheel['target'], 'a publishable tag')}"
+                + (" (a linux_* wheel is one auditwheel didn't repair)" if unrepaired else ""))  # fmt: skip
     if build_lab.canonical(wheel["name"]) in optout:
         return "the project opted out"
     if info is None:
@@ -1002,10 +1236,19 @@ def take_wheel(repo: str, wheel: dict) -> tuple[bytes | None, str | None]:
             break
     if data is None:
         return None, "no build run kept a wheel with the verified sha256"
-    if (missing := missing_dlls(data)) is None:
-        return None, "couldn't read its extension modules' imports"
-    if missing:
-        return None, f"needs DLLs a user's machine may not have: {', '.join(missing[:5])}"
+    plat = build_lab.TARGETS[wheel["target"]].get("plat")
+    if plat is None:  # Windows: the DLLs its .pyd/.dll files import (PE)
+        if (missing := missing_dlls(data)) is None:
+            return None, "couldn't read its extension modules' imports"
+        if missing:
+            return None, f"needs DLLs a user's machine may not have: {', '.join(missing[:5])}"
+    elif plat not in LINUX_POLICIES:
+        return None, f"no library policy for {plat}"
+    else:  # Linux: the libraries and symbol versions its ELF files need
+        if (missing := missing_libs(data, plat)) is None:
+            return None, "couldn't read its ELF files' needs"
+        if missing:
+            return None, f"needs libraries or symbol versions a {plat} system may not have: {', '.join(missing[:5])}"
     return data, None
 
 
@@ -1035,9 +1278,7 @@ def cmd_stage(args: argparse.Namespace) -> int:
                        "licence": licence(info), "requires_python": info.get("requires_python") or None,
                        "verified": manifest.get("date"), "batch": manifest.get("run")})  # fmt: skip
     (out / "staged.json").write_text(json.dumps(staged, indent=1) + "\n", encoding="utf-8")
-    tests = sorted({w["target"] for w in staged})
-    matrix = [{"target": t, "runner": build_lab.TARGETS[t]["runner"], "python": build_lab.TARGETS[t]["python"],
-               "slug": t.replace(" ", "-")} for t in tests]  # fmt: skip
+    matrix = [install_test_job(t) for t in sorted({w["target"] for w in staged})]
     text = "\n".join([f"**{len(staged)} staged** of {len(manifest['wheels'])} verified", "",
                       "| package | version | target | |", "|---|---|---|---|", *lines]) + "\n"  # fmt: skip
     print(text)
@@ -1050,6 +1291,18 @@ def cmd_stage(args: argparse.Namespace) -> int:
             f.write(f"staged={json.dumps(staged, separators=(',', ':'))}\n")
             f.write(f"tests={json.dumps(matrix, separators=(',', ':'))}\n")
     return 0
+
+
+def install_test_job(target: str) -> dict[str, str]:
+    """The install-test matrix entry for a target. Every key is always there (empty when it doesn't apply), so the
+    workflow's conditions compare strings: Windows runs on the runner with setup-python (`python`); Linux runs `docker
+    run` of `image` with its `interpreter`, after fetching `python_url` when there is one (LINUX_TESTS)."""
+    spec = build_lab.TARGETS[target]
+    job = {"target": target, "runner": spec["runner"], "python": spec["python"], "slug": target.replace(" ", "-"),
+           "image": "", "interpreter": "", "python_url": "", "python_sha256": ""}  # fmt: skip
+    if "plat" in spec:
+        job.update(LINUX_TESTS[target])
+    return job
 
 
 def install_and_import(wheel: Path, target: str, work: Path) -> str | None:

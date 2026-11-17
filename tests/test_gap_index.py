@@ -177,6 +177,42 @@ class Index(unittest.TestCase):
                     self.assertIn(f"releases/download/gap-wheels/{ours}", page)
                     self.assertNotIn("withdrawn: PyPI has its own now", human)
 
+    def test_a_linux_wheel_drops_out_once_pypi_has_one_for_an_older_or_equal_libc(self):
+        cases = {
+            "lz4-4.4.5-cp314-cp314t-manylinux_2_28_x86_64.whl": (
+                ["manylinux_2_28_x86_64", "manylinux_2_17_x86_64", "manylinux2014_x86_64", "manylinux1_x86_64",
+                 "manylinux_2_17_x86_64.manylinux2014_x86_64", "manylinux_2_5_x86_64.manylinux1_x86_64",
+                 "manylinux_2_17_x86_64.manylinux_2_34_aarch64"],  # one of its tags is enough
+                ["manylinux_2_34_x86_64", "manylinux_2_17_aarch64", "musllinux_1_1_x86_64", "linux_x86_64",
+                 "manylinux2014_x86_64x", "manylinux_2_34_x86_64.manylinux_2_17_aarch64"],
+            ),
+            "lz4-4.4.5-cp314-cp314-musllinux_1_2_aarch64.whl": (
+                ["musllinux_1_2_aarch64", "musllinux_1_1_aarch64"],
+                ["musllinux_1_3_aarch64", "manylinux_2_17_aarch64", "musllinux_1_1_x86_64"],
+            ),
+        }  # fmt: skip
+        for ours, (withdrawn, kept) in cases.items():
+            py, abi = ours.split("-")[2:4]
+            for plat in withdrawn + kept:
+                with self.subTest(ours=ours, theirs=plat):
+                    theirs = f"lz4-4.4.5-{py}-{abi}-{plat}.whl"
+                    site = self.build([wheel(name="lz4", file=ours, version="4.4.5")], {"lz4": [pypi_file(theirs)]})
+                    page = (site / "simple/lz4/index.html").read_text()
+                    self.assertEqual("releases/download" not in page, plat in withdrawn)
+        # The GIL build doesn't cover 3.14t, however old its glibc.
+        ours = "lz4-4.4.5-cp314-cp314t-manylinux_2_28_x86_64.whl"
+        site = self.build([wheel(name="lz4", file=ours, version="4.4.5")],
+                          {"lz4": [pypi_file("lz4-4.4.5-cp314-cp314-manylinux_2_17_x86_64.whl")]})  # fmt: skip
+        self.assertIn(f"gap-wheels/{ours}", (site / "simple/lz4/index.html").read_text())
+        self.assertTrue(build_gap_index.covers(("cp39", "abi3", "manylinux_2_17_x86_64"),
+                                               ("cp315", "cp315", "manylinux_2_28_x86_64")))  # fmt: skip
+
+    def test_the_page_names_the_platforms(self):
+        page = (self.build([wheel()]) / "index.html").read_text()
+        self.assertNotIn("Windows only for now", page)
+        for text in ("manylinux_2_28", "musllinux_1_2", "auditwheel", "approves a publish run"):
+            self.assertIn(text, page)
+
     def test_free_threaded_wheels_arent_replaced_by_abi3(self):
         ours = "tiktoken-0.14.0-cp314-cp314t-win_arm64.whl"
         site = self.build([wheel(file=ours)], {"tiktoken": [pypi_file("tiktoken-0.14.0-cp39-abi3-win_arm64.whl")]})

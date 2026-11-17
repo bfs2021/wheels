@@ -4,10 +4,12 @@ name: Gap wheels
 # wheel verified only if both builds are byte-identical, from the sdist PyPI publishes, and pip installs it without
 # compiling anything. Each build runs in a workflow run of its own (gap-wheel-build.yml), so a package's build code
 # can't write another build's result. The collect job writes manifest.json (filenames, hashes and each build's run) as
-# an artifact and stages the verified Windows wheels (each taken from its build run only with the verified sha256);
-# install-test installs and imports them on fresh runners; publish attests the ones that passed, uploads them to the
-# `gap-wheels` release, commits data/gap-wheels.json (the index the site builds) and starts a site deploy, but only
-# after a maintainer approves the `publish` environment for that run. The candidate pairs come from the tracker's build
+# an artifact and stages the verified wheels that may be published (each taken from its build run only with the
+# verified sha256, and only if it needs no DLL, library or glibc symbol version a user's system may lack);
+# install-test installs and imports them on fresh runners (Linux ones in a minimal container of their libc);
+# publish attests the ones that passed, uploads them to the `gap-wheels` release, commits data/gap-wheels.json (the
+# index the site builds) and starts a site deploy, but only after a maintainer approves the `publish` environment for
+# that run. The candidate pairs come from the tracker's build
 # lab (wheelgap/tracker data/builds.json). See scripts/gap_wheels.py and README.md (the threat model).
 
 on:
@@ -137,6 +139,10 @@ jobs:
     # Installs and imports each staged wheel on a fresh runner of its target. This runs package code, so it gets a
     # read-only token and no secrets, and publish trusts its answers only to skip a wheel, never for which bytes.
     # Don't add actions/cache (or a setup action's cache) here: package code could write entries main restores.
+    # Windows targets run on the runner with setup-python. Linux targets run in a minimal image of their libc with the
+    # target's exact CPython (`image`, `interpreter`, and for 3.14t a pinned python-build-standalone: LINUX_TESTS in
+    # scripts/gap_wheels.py), so the import proves the wheel works on a clean system, not on GitHub's well-stocked
+    # runner image. With `docker run`, not a job container: setup-python and JavaScript actions don't run in Alpine.
     needs: collect
     if: ${{ !cancelled() && needs.collect.result == 'success' && needs.collect.outputs.tests != '' && needs.collect.outputs.tests != '[]' }}
     strategy:
@@ -152,6 +158,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: matrix.image == ''
         with:
           python-version: ${{ matrix.python }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -159,10 +166,38 @@ jobs:
           name: staged
           path: staged
       - name: Install and import each wheel in a fresh venv
+        if: matrix.image == ''
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: python scripts/gap_wheels.py install-test --staged staged --target "$TARGET" --out tested.json
+      - name: Fetch the target's pinned CPython, checked by sha256
+        if: matrix.image != '' && matrix.python_url != ''
+        shell: bash
+        env:
+          PYTHON_URL: ${{ matrix.python_url }}
+          PYTHON_SHA256: ${{ matrix.python_sha256 }}
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSfL --max-time 300 -o "$RUNNER_TEMP/python.tar.gz" "$PYTHON_URL"
+          echo "$PYTHON_SHA256  $RUNNER_TEMP/python.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/python"
+          tar -xzf "$RUNNER_TEMP/python.tar.gz" -C "$RUNNER_TEMP/python" --strip-components=1
+      - name: Install and import each wheel in a fresh venv, in a minimal container
+        if: matrix.image != ''
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          INTERPRETER: ${{ matrix.interpreter }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          # The checkout (with the staged wheels) and the CPython are mounted read-only; the answer goes to its own
+          # folder. No token or secret is passed in.
+          mkdir -p "$RUNNER_TEMP/out"
+          python=()
+          if [ -d "$RUNNER_TEMP/python" ]; then python=(-v "$RUNNER_TEMP/python:/opt/python:ro"); fi
+          docker run --rm -v "$PWD:/lab:ro" -v "$RUNNER_TEMP/out:/out" "${python[@]}" -w /lab "$IMAGE" \
+            "$INTERPRETER" scripts/gap_wheels.py install-test --staged staged --target "$TARGET" --out /out/tested.json
+          cp "$RUNNER_TEMP/out/tested.json" tested.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tested-${{ matrix.slug }}

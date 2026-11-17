@@ -3,7 +3,10 @@
 import hashlib
 import io
 import json
+import platform
+import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -501,6 +504,8 @@ class Rotation(unittest.TestCase):
 # --- stage, install-test and publish -------------------------------------------------------------------------------
 
 WIN = "tiktoken-0.14.0-cp314-cp314-win_arm64.whl"
+GLIBC_T = "lz4-0.14.0-cp314-cp314t-manylinux_2_28_x86_64.whl"
+MUSL = "lz4-0.14.0-cp314-cp314-musllinux_1_2_aarch64.whl"
 
 
 def verified(name="tiktoken", wheel=WIN, sha="c" * 64, target="3.14 win-arm64"):
@@ -522,10 +527,19 @@ def zipped(members):
 
 
 class Stage(unittest.TestCase):
-    def test_only_windows_wheels_with_a_licence_and_no_opt_out(self):
+    def test_only_wheels_with_their_tag_a_licence_and_no_opt_out(self):
         self.assertIsNone(gap_wheels.stage_reason(verified(), MIT, set()))
         linux = verified(wheel="lz4-4.4.5-cp314-cp314-linux_aarch64.whl", target="3.14 musl-aarch64")
-        self.assertIn("auditwheel", gap_wheels.stage_reason(linux, MIT, set()))
+        self.assertEqual(gap_wheels.stage_reason(linux, MIT, set()), "not tagged exactly "
+                         "cp314-cp314-musllinux_1_2_aarch64 (a linux_* wheel is one auditwheel didn't repair)")  # fmt: skip
+        for wheel, target in ((MUSL, "3.14 musl-aarch64"), (GLIBC_T, "3.14t linux-x86_64"),
+                              ("lz4-4.4.5-cp315-cp315-manylinux_2_28_x86_64.whl", "3.15 linux-x86_64")):  # fmt: skip
+            with self.subTest(wheel):
+                self.assertIsNone(gap_wheels.stage_reason(verified(name="lz4", wheel=wheel, target=target), MIT, set()))
+        older = verified(name="lz4", wheel="lz4-4.4.5-cp314-cp314t-manylinux_2_17_x86_64.whl", target="3.14t linux-x86_64")
+        self.assertEqual(gap_wheels.stage_reason(older, MIT, set()), "not tagged exactly cp314-cp314t-manylinux_2_28_x86_64")
+        mixed = verified(name="lz4", wheel=GLIBC_T, target="3.14t linux-x86_64")
+        self.assertEqual(gap_wheels.stage_reason(mixed, MIT, {"lz4"}), "the project opted out")
         self.assertEqual(gap_wheels.stage_reason(verified(), MIT, {"tiktoken"}), "the project opted out")
         self.assertEqual(gap_wheels.stage_reason(verified(), None, set()), "couldn't ask PyPI for the licence")
         self.assertIn("licence", gap_wheels.stage_reason(verified(), {"license": "see LICENSE"}, set()))
@@ -541,11 +555,51 @@ class Stage(unittest.TestCase):
             ("x-1.0-cp38-abi3-win_arm64.whl", "3.14 win-arm64"),  # other Pythons would take it untested
             ("x-1.0-py3-none-win_arm64.whl", "3.14 win-arm64"),
             ("x-1.0-cp314-cp314-win_arm64.whl", "3.14t win-arm64"),
-            ("x-1.0-cp314-cp314t-linux_x86_64.whl", "3.14t linux-x86_64"),
+            ("x-1.0-cp314-cp314t-linux_x86_64.whl", "3.14t linux-x86_64"),  # pip wheel's tag: any libc, any version
             ("x-1.0-cp314-cp314-WIN_ARM64.whl", "3.14 win-arm64"),
+            # Linux: only auditwheel's one repaired tag, for that target's Python, libc and architecture.
+            ("x-1.0-cp314-cp314t-manylinux_2_28_x86_64.manylinux2014_x86_64.whl", "3.14t linux-x86_64"),
+            ("x-1.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_28_x86_64.whl", "3.14t linux-x86_64"),
+            ("x-1.0-cp314-cp314t-manylinux_2_17_x86_64.whl", "3.14t linux-x86_64"),  # a glibc it wasn't checked for
+            ("x-1.0-cp314-cp314t-manylinux2014_x86_64.whl", "3.14t linux-x86_64"),
+            ("x-1.0-cp314-cp314t-manylinux_2_34_x86_64.whl", "3.14t linux-x86_64"),
+            ("x-1.0-cp314-cp314-manylinux_2_28_x86_64.whl", "3.14t linux-x86_64"),  # the GIL build
+            ("x-1.0-cp314-cp314t-manylinux_2_28_aarch64.whl", "3.14t linux-x86_64"),
+            ("x-1.0-cp314-cp314t-musllinux_1_2_x86_64.whl", "3.14t linux-x86_64"),
+            ("x-1.0-cp314-cp314-musllinux_1_1_aarch64.whl", "3.14 musl-aarch64"),
+            ("x-1.0-cp314-cp314-musllinux_1_2_aarch64.musllinux_1_1_aarch64.whl", "3.14 musl-aarch64"),
+            ("x-1.0-cp314-cp314-manylinux_2_28_aarch64.whl", "3.14 musl-aarch64"),
+            ("x-1.0-cp314-cp314-linux_aarch64.whl", "3.14 musl-aarch64"),
+            ("x-1.0-cp315-cp315-linux_x86_64.whl", "3.15 linux-x86_64"),
+            ("x-1.0-cp315-abi3-manylinux_2_28_x86_64.whl", "3.15 linux-x86_64"),
+            ("x-1.0-cp314-cp314t-manylinux_2_28_x86_64.whl", "3.15 linux-x86_64"),
         ):
             with self.subTest(wheel):
                 self.assertFalse(gap_wheels.tag_ok(wheel, target))
+        for wheel, target in (("x-1.0-cp314-cp314t-manylinux_2_28_x86_64.whl", "3.14t linux-x86_64"),
+                              ("x-1.0-cp314-cp314-musllinux_1_2_aarch64.whl", "3.14 musl-aarch64"),
+                              ("x-1.0-cp315-cp315-manylinux_2_28_x86_64.whl", "3.15 linux-x86_64")):  # fmt: skip
+            with self.subTest(wheel):
+                self.assertTrue(gap_wheels.tag_ok(wheel, target))
+
+    def test_each_linux_tag_is_the_one_its_build_repairs_to_with_a_policy_and_a_test_image(self):
+        linux = [t for t, spec in gap_wheels.build_lab.TARGETS.items() if "plat" in spec]
+        self.assertEqual(sorted(linux), sorted(t for t in gap_wheels.PUBLISH_TAGS if t in linux))  # every one
+        for target in linux:
+            with self.subTest(target):
+                spec = gap_wheels.build_lab.TARGETS[target]
+                self.assertTrue(gap_wheels.PUBLISH_TAGS[target].endswith("-" + spec["plat"]))
+                self.assertIn(spec["plat"], gap_wheels.LINUX_POLICIES)
+                test = gap_wheels.LINUX_TESTS[target]
+                self.assertRegex(test["image"], r"^[a-z0-9.:/_-]+@sha256:[0-9a-f]{64}$")  # pinned by digest
+                self.assertEqual(test["runner"], "ubuntu-24.04-arm" if target.endswith("aarch64") else "ubuntu-latest")
+                if "python_url" in test:
+                    self.assertTrue(test["python_url"].startswith("https://github.com/astral-sh/python-build-standalone/releases/download/"))
+                    self.assertRegex(test["python_sha256"], r"^[0-9a-f]{64}$")
+                    self.assertTrue(test["interpreter"].startswith("/opt/python/"))
+        self.assertEqual(gap_wheels.LINUX_POLICIES["manylinux_2_28_x86_64"]["machine"], 62)
+        self.assertEqual(gap_wheels.LINUX_POLICIES["musllinux_1_2_aarch64"]["machine"], 183)
+        self.assertEqual(gap_wheels.REPAIR_TOOLS[0], "auditwheel==6.8.2")  # the version the policies are copied from
 
     def test_licence(self):
         self.assertEqual(gap_wheels.licence({"license_expression": "Apache-2.0 OR MIT"}), "Apache-2.0 OR MIT")
@@ -610,7 +664,58 @@ class Stage(unittest.TestCase):
             self.assertEqual(staged[0]["requires_python"], ">=3.9")
             self.assertEqual(gap_wheels.trusted_staged(lines["staged"]), staged)
             self.assertEqual(json.loads(lines["tests"]), [{"target": "3.14 win-arm64", "runner": "windows-11-arm",
-                                                           "python": "3.14", "slug": "3.14-win-arm64"}])  # fmt: skip
+                                                           "python": "3.14", "slug": "3.14-win-arm64", "image": "",
+                                                           "interpreter": "", "python_url": "",
+                                                           "python_sha256": ""}])  # fmt: skip
+
+    def test_a_linux_wheel_is_staged_after_its_elf_check_and_tested_in_a_container(self):
+        ext = elf(["libc.so.6", "libgomp-24e2ab19.so.1.0.0"], {"libc.so.6": ["GLIBC_2.2.5", "GLIBC_2.17"]})
+        lib = elf(["libc.so.6"], {"libc.so.6": ["GLIBC_2.28"]})
+        ok = zipped({"lz4/_block.cpython-314t-x86_64-linux-gnu.so": ext, "lz4.libs/libgomp-24e2ab19.so.1.0.0": lib})
+        new = zipped({"lz4/_block.cpython-314t-x86_64-linux-gnu.so": elf(["libc.so.6"], {"libc.so.6": ["GLIBC_2.34"]})})
+        musl = zipped({"lz4/_block.cpython-314-aarch64-linux-musl.so": elf(["libc.musl-aarch64.so.1"], machine=183)})
+        wheels = [verified(name="lz4", wheel=GLIBC_T, sha=hashlib.sha256(ok).hexdigest(), target="3.14t linux-x86_64"),
+                  verified(name="zstandard", wheel="zstandard-0.14.0-cp314-cp314t-manylinux_2_28_x86_64.whl",
+                           sha=hashlib.sha256(new).hexdigest(), target="3.14t linux-x86_64"),
+                  verified(name="lz4", wheel=MUSL, sha=hashlib.sha256(musl).hexdigest(), target="3.14 musl-aarch64")]  # fmt: skip
+        archives = {GLIBC_T: zipped({GLIBC_T: ok}), MUSL: zipped({MUSL: musl}),
+                    wheels[1]["wheel"]: zipped({wheels[1]["wheel"]: new})}  # fmt: skip
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "m.json").write_text(json.dumps({"wheels": wheels}))
+            out = tmp / "out.txt"
+            args = gap_wheels.main.__globals__["argparse"].Namespace(
+                manifest=str(tmp / "m.json"), staged=str(tmp / "staged"), repo="r/r", optout=str(tmp / "none"),
+                summary=str(tmp / "summary.md"), github_output=str(out))  # fmt: skip
+            calls = iter([archives[w["wheel"]] for w in wheels])
+            with mock.patch.object(gap_wheels, "pypi_info", return_value=MIT), \
+                 mock.patch.object(gap_wheels, "missing_dlls", side_effect=AssertionError("PE check on Linux")), \
+                 mock.patch.object(gap_wheels, "fetch_wheel", side_effect=lambda repo, rid: next(calls)):  # fmt: skip
+                gap_wheels.cmd_stage(args)
+            lines = dict(line.split("=", 1) for line in out.read_text().splitlines())
+            self.assertEqual([w["wheel"] for w in json.loads(lines["staged"])], [GLIBC_T, MUSL])
+            self.assertIn("needs libraries or symbol versions a manylinux_2_28_x86_64 system may not have: GLIBC_2.34",
+                          (tmp / "summary.md").read_text())  # fmt: skip
+            tests = {t["target"]: t for t in json.loads(lines["tests"])}
+            self.assertEqual(tests["3.14 musl-aarch64"], {
+                "target": "3.14 musl-aarch64", "runner": "ubuntu-24.04-arm", "python": "3.14", "slug": "3.14-musl-aarch64",
+                "image": gap_wheels.LINUX_TESTS["3.14 musl-aarch64"]["image"], "interpreter": "python",
+                "python_url": "", "python_sha256": ""})  # fmt: skip
+            self.assertTrue(tests["3.14 musl-aarch64"]["image"].startswith("python:3.14-alpine@sha256:"))
+            glibc = tests["3.14t linux-x86_64"]
+            self.assertEqual((glibc["runner"], glibc["interpreter"]), ("ubuntu-latest", "/opt/python/bin/python3.14t"))
+            self.assertTrue(glibc["image"].startswith("debian:trixie-slim@sha256:"))
+            self.assertIn("x86_64-unknown-linux-gnu-freethreaded-install_only.tar.gz", glibc["python_url"])
+            self.assertEqual(glibc["python_sha256"], gap_wheels.LINUX_TESTS["3.14t linux-x86_64"]["python_sha256"])
+
+    def test_install_test_jobs(self):
+        self.assertEqual(gap_wheels.install_test_job("3.15 win-amd64")["image"], "")
+        job = gap_wheels.install_test_job("3.15 linux-x86_64")
+        self.assertEqual((job["runner"], job["interpreter"], job["python_url"]), ("ubuntu-latest", "python", ""))
+        self.assertTrue(job["image"].startswith("python:3.15-slim-trixie@sha256:"))
+        for target in gap_wheels.build_lab.TARGETS:
+            self.assertEqual(set(gap_wheels.install_test_job(target)), {"target", "runner", "python", "slug", "image",
+                             "interpreter", "python_url", "python_sha256"})  # fmt: skip
 
     def test_a_build_run_with_other_bytes_falls_back_to_the_other_build(self):
         data = b"wheel bytes"
@@ -824,6 +929,205 @@ class Dlls(unittest.TestCase):
                 with mock.patch.object(gap_wheels, "pypi_info", return_value=MIT):
                     self.assertEqual(gap_wheels.cmd_stage(args), 0)
                 self.assertEqual(json.loads((tmp / "staged" / "staged.json").read_text()), [])
+
+
+def elf(needed=(), versions=None, machine=62, ident=b"\x7fELF\x02\x01\x01", dynamic=True):
+    """A minimal 64-bit ELF shared object needing the libraries `needed` (DT_NEEDED) and, from each file in `versions`,
+    those symbol versions (a version-needs table): what elf_needs reads, nothing more. One PT_LOAD maps the whole file
+    at address 0, so addresses are file offsets."""
+    versions = versions or {}
+    strtab = bytearray(b"\0")
+
+    def add(text):
+        strtab.extend(text.encode() + b"\0")
+        return len(strtab) - len(text) - 1
+
+    need = [add(n) for n in needed]
+    verneed = bytearray()
+    for i, (file, names) in enumerate(versions.items()):
+        last = i == len(versions) - 1
+        verneed += struct.pack("<HHIII", 1, len(names), add(file), 16, 0 if last else 16 + 16 * len(names))
+        for j, name in enumerate(names):
+            verneed += struct.pack("<IHHII", 0, 0, 0, add(name), 0 if j == len(names) - 1 else 16)
+    dyn_at, str_at = 0x100, 0x300
+    ver_at = str_at + (len(strtab) + 7) // 8 * 8
+    tags = [(1, o) for o in need] + [(5, str_at), (10, len(strtab))]
+    if versions:
+        tags += [(0x6FFFFFFE, ver_at), (0x6FFFFFFF, len(versions))]
+    dyn = b"".join(struct.pack("<qQ", t, v) for t, v in [*tags, (0, 0)])
+    assert len(dyn) <= str_at - dyn_at
+    size = ver_at + len(verneed)
+    out = bytearray(size)
+    out[0:64] = ident.ljust(16, b"\0") + struct.pack("<HHIQQQIHHHHHH", 3, machine, 1, 0, 64, 0, 0, 64, 56,
+                                                    2 if dynamic else 1, 64, 0, 0)  # fmt: skip
+    out[64:120] = struct.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, size, size, 0x1000)  # PT_LOAD: the whole file
+    if dynamic:
+        out[120:176] = struct.pack("<IIQQQQQQ", 2, 6, dyn_at, dyn_at, dyn_at, len(dyn), len(dyn), 8)  # PT_DYNAMIC
+    out[dyn_at : dyn_at + len(dyn)] = dyn
+    out[str_at : str_at + len(strtab)] = strtab
+    out[ver_at:] = verneed
+    return bytes(out)
+
+
+GLIBC_POLICY = "manylinux_2_28_x86_64"
+
+
+class Elf(unittest.TestCase):
+    def test_reads_needed_libraries_and_symbol_versions(self):
+        data = elf(["libc.so.6", "libstdc++.so.6"], {"libc.so.6": ["GLIBC_2.2.5", "GLIBC_2.17"],
+                                                    "libstdc++.so.6": ["GLIBCXX_3.4.21", "CXXABI_1.3.9"],
+                                                    "ld-linux-x86-64.so.2": ["GLIBC_2.3"]})  # fmt: skip
+        libs, versions = gap_wheels.elf_needs(data, 62)
+        self.assertEqual(libs, {"libc.so.6", "libstdc++.so.6"})
+        # The loader's own versions are left out, as auditwheel does.
+        self.assertEqual(versions, {"GLIBC_2.2.5", "GLIBC_2.17", "GLIBCXX_3.4.21", "CXXABI_1.3.9"})
+        self.assertEqual(gap_wheels.elf_needs(elf(["libc.musl-aarch64.so.1"], machine=183), 183),
+                         ({"libc.musl-aarch64.so.1"}, set()))  # fmt: skip
+        self.assertEqual(gap_wheels.elf_needs(elf(dynamic=False), 62), (set(), set()))  # static: needs nothing
+
+    def test_garbage_truncated_32_bit_big_endian_and_other_machines_are_unreadable(self):
+        good_elf = elf(["libc.so.6"], {"libc.so.6": ["GLIBC_2.17"]})
+        self.assertIsNotNone(gap_wheels.elf_needs(good_elf, 62))
+        for label, bad in (
+            ("empty", b""),
+            ("magic only", b"\x7fELF"),
+            ("garbage", b"not an elf" * 100),
+            ("a PE file", pe(["kernel32.dll"])),
+            ("headers only", good_elf[:0x80]),
+            ("no strings", good_elf[:0x300]),
+            ("half a version table", good_elf[:-8]),
+            ("32-bit", elf(["libc.so.6"], ident=b"\x7fELF\x01\x01\x01")),
+            ("big-endian", elf(["libc.so.6"], ident=b"\x7fELF\x02\x02\x01")),
+            ("aarch64 for x86_64", elf(["libc.so.6"], machine=183)),
+            ("not ASCII", elf(["libc\u00e9.so.6"])),
+        ):
+            with self.subTest(label):
+                self.assertIsNone(gap_wheels.elf_needs(bad, 62))
+        self.assertIsNone(gap_wheels.elf_needs(elf(["libc.so.6"]), 183))  # x86_64 for aarch64
+
+    def test_odd_tables_are_unreadable(self):
+        data = bytearray(elf(["libc.so.6"], {"libc.so.6": ["GLIBC_2.17", "GLIBC_2.28"]}))
+        strsz_at = 0x100 + 16 * 2 + 8  # DT_STRSZ's value
+        for label, at, value in (
+            ("a string table past the file", strsz_at, 1 << 20),
+            ("a needed name past the strings", 0x100 + 8, 1 << 16),
+            ("a dynamic segment past the file", 120 + 16, 1 << 32),
+            ("a version count that never ends", 0x100 + 16 * 4 + 8, 4096),
+        ):
+            with self.subTest(label):
+                bad = bytearray(data)
+                bad[at : at + 8] = struct.pack("<Q", value)
+                self.assertIsNone(gap_wheels.elf_needs(bytes(bad), 62))
+        no_null = bytearray(data)
+        no_null[0x100 + 16 * 5 : 0x100 + 16 * 6] = struct.pack("<qQ", 0x6FFFFFF0, 0)  # DT_NULL replaced
+        self.assertIsNone(gap_wheels.elf_needs(bytes(no_null), 62))
+
+    @unittest.skipUnless(sys.platform == "linux" and platform.machine() == "x86_64", "a real x86_64 glibc ELF file")
+    def test_a_real_interpreter(self):
+        needs = gap_wheels.elf_needs(Path(sys.executable).resolve().read_bytes(), 62)
+        self.assertIsNotNone(needs)
+        self.assertIn("libc.so.6", needs[0])
+        self.assertTrue(any(v.startswith("GLIBC_2.") for v in needs[1]))
+
+    def test_libraries_must_be_on_the_policy_or_in_the_wheel(self):
+        ext = "pkg/_ext.cpython-314t-x86_64-linux-gnu.so"
+        allowed = elf(["libc.so.6", "libm.so.6", "libstdc++.so.6", "ld-linux-x86-64.so.2"],
+                      {"libc.so.6": ["GLIBC_2.2.5", "GLIBC_2.28"], "libstdc++.so.6": ["GLIBCXX_3.4.24", "CXXABI_TM_1"],
+                       "libgcc_s.so.1": ["GCC_7.0.0"]})  # fmt: skip
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: allowed}), GLIBC_POLICY), [])
+        bundled = elf(["libc.so.6", "libgomp-24e2ab19.so.1.0.0"])
+        gomp = elf(["libc.so.6"], {"libc.so.6": ["GLIBC_2.17"], "libcrypto-abc.so.3": ["OPENSSL_3.0.0"]})
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled, "pkg.libs/libgomp-24e2ab19.so.1.0.0": gomp}),
+                                                 GLIBC_POLICY), [])  # fmt: skip
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled}), GLIBC_POLICY), ["libgomp-24e2ab19.so.1.0.0"])
+        missing = elf(["libc.so.6", "libssl.so.3", "libpython3.14t.so.1.0"])
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: missing}), GLIBC_POLICY),
+                         ["libpython3.14t.so.1.0", "libssl.so.3"])  # fmt: skip
+        # A bundled library is checked too: its own needs count.
+        gomp_needs = elf(["libc.so.6", "libnuma.so.1"])
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled, "pkg.libs/libgomp-24e2ab19.so.1.0.0": gomp_needs}),
+                                                 GLIBC_POLICY), ["libnuma.so.1"])  # fmt: skip
+        # Any ELF file, whatever its name, and a shared object, whatever's in it.
+        self.assertEqual(gap_wheels.missing_libs(zipped({"pkg.data/scripts/tool": missing}), GLIBC_POLICY),
+                         ["libpython3.14t.so.1.0", "libssl.so.3"])  # fmt: skip
+        self.assertIsNone(gap_wheels.missing_libs(zipped({ext: b"not an elf"}), GLIBC_POLICY))
+        self.assertIsNone(gap_wheels.missing_libs(zipped({"pkg/libfoo.so.1": b"\x7fELF junk"}), GLIBC_POLICY))
+        self.assertEqual(gap_wheels.missing_libs(zipped({"pkg/data.bin": b"plain bytes", "pkg/__init__.py": b""}),
+                                                 GLIBC_POLICY), [])  # fmt: skip
+        many = zipped({f"pkg/m{i}.so": allowed for i in range(501)})
+        self.assertIsNone(gap_wheels.missing_libs(many, GLIBC_POLICY))  # too many to check: refused, not half-checked
+
+    def test_glibc_symbol_versions_above_the_policy_are_refused(self):
+        ext = "pkg/_ext.cpython-314t-x86_64-linux-gnu.so"
+        for needs, missing in (
+            ({"libc.so.6": ["GLIBC_2.17", "GLIBC_2.34"]}, ["GLIBC_2.34"]),
+            ({"libc.so.6": ["GLIBC_2.29"]}, ["GLIBC_2.29"]),
+            ({"libc.so.6": ["GLIBC_PRIVATE"]}, ["GLIBC_PRIVATE"]),
+            ({"libc.so.6": ["GLIBC_ABI_DT_RELR"]}, ["GLIBC_ABI_DT_RELR"]),
+            ({"libstdc++.so.6": ["GLIBCXX_3.4.30"]}, ["GLIBCXX_3.4.30"]),
+            ({"libstdc++.so.6": ["CXXABI_1.3.13"]}, ["CXXABI_1.3.13"]),
+            ({"libgcc_s.so.1": ["GCC_12.0.0"]}, ["GCC_12.0.0"]),
+            ({"libz.so.1": ["ZLIB_1.2.12"]}, ["ZLIB_1.2.12"]),
+            ({"libstdc++.so.6": ["GLIBCXX_3.4.24"], "libc.so.6": ["GLIBC_2.28"]}, []),
+        ):
+            with self.subTest(needs):
+                data = elf(["libc.so.6", "libstdc++.so.6", "libgcc_s.so.1", "libz.so.1"], needs)
+                self.assertEqual(gap_wheels.missing_libs(zipped({ext: data}), GLIBC_POLICY), missing)
+
+    def test_musl_checks_libraries_only(self):
+        ext = "pkg/_ext.cpython-314-aarch64-linux-musl.so"
+        gcc = elf(["libc.musl-aarch64.so.1"], machine=183)
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: elf(["libc.musl-aarch64.so.1"], machine=183)}),
+                                                 "musllinux_1_2_aarch64"), [])  # fmt: skip
+        ok = elf(["libc.musl-aarch64.so.1", "libz.so.1", "libgcc_s-0366c7ba.so.1"], machine=183)
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: ok, "pkg.libs/libgcc_s-0366c7ba.so.1": gcc}),
+                                                 "musllinux_1_2_aarch64"), [])  # fmt: skip
+        glibc = elf(["libc.so.6", "libstdc++.so.6"], machine=183)
+        self.assertEqual(gap_wheels.missing_libs(zipped({ext: glibc}), "musllinux_1_2_aarch64"),
+                         ["libc.so.6", "libstdc++.so.6"])  # fmt: skip
+        self.assertIsNone(gap_wheels.missing_libs(zipped({ext: elf(["libc.so.6"])}), "musllinux_1_2_aarch64"))  # x86_64
+
+    def test_stage_uses_the_targets_check(self):
+        data = zipped({"pkg/_ext.cpython-314t-x86_64-linux-gnu.so": elf(["libc.so.6", "libssl.so.3"])})
+        wheel = verified(name="lz4", wheel=GLIBC_T, sha=hashlib.sha256(data).hexdigest(), target="3.14t linux-x86_64")
+        with mock.patch.object(gap_wheels, "fetch_wheel", return_value=zipped({GLIBC_T: data})), \
+             mock.patch.object(gap_wheels, "missing_dlls", side_effect=AssertionError("PE check on Linux")):  # fmt: skip
+            self.assertEqual(gap_wheels.take_wheel("r/r", wheel), (None, "needs libraries or symbol versions a "
+                             "manylinux_2_28_x86_64 system may not have: libssl.so.3"))  # fmt: skip
+        junk = zipped({"pkg/_ext.cpython-314t-x86_64-linux-gnu.so": b"junk"})
+        wheel = verified(name="lz4", wheel=GLIBC_T, sha=hashlib.sha256(junk).hexdigest(), target="3.14t linux-x86_64")
+        with mock.patch.object(gap_wheels, "fetch_wheel", return_value=zipped({GLIBC_T: junk})):
+            self.assertEqual(gap_wheels.take_wheel("r/r", wheel), (None, "couldn't read its ELF files' needs"))
+        # A Windows wheel still gets the PE check, which knows nothing of ELF.
+        win = zipped({"pkg/_ext.pyd": pe(["python314.dll", "MSVCP140.dll"])})
+        wheel = verified(sha=hashlib.sha256(win).hexdigest())
+        with mock.patch.object(gap_wheels, "fetch_wheel", return_value=zipped({WIN: win})), \
+             mock.patch.object(gap_wheels, "missing_libs", side_effect=AssertionError("ELF check on Windows")):  # fmt: skip
+            self.assertEqual(gap_wheels.take_wheel("r/r", wheel)[1], "needs DLLs a user's machine may not have: msvcp140.dll")
+
+
+class InstallTestLinux(unittest.TestCase):
+    def test_tests_only_its_targets_wheels_with_the_containers_python(self):
+        staged = [verified(name="lz4", wheel=MUSL, target="3.14 musl-aarch64"), verified()]
+        seen = []
+
+        def fake(wheel, target, work):
+            seen.append((wheel.name, target))
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "staged.json").write_text(json.dumps(staged))
+            with mock.patch.object(gap_wheels.build_lab, "interpreter_problem", return_value=None), \
+                 mock.patch.object(gap_wheels, "install_and_import", fake):  # fmt: skip
+                self.assertEqual(gap_wheels.main(["install-test", "--staged", str(tmp), "--target", "3.14 musl-aarch64",
+                                                  "--out", str(tmp / "tested.json")]), 0)  # fmt: skip
+            self.assertEqual(seen, [(MUSL, "3.14 musl-aarch64")])
+            self.assertEqual(json.loads((tmp / "tested.json").read_text()),
+                             {"target": "3.14 musl-aarch64", "tested": {MUSL: True}})  # fmt: skip
+            with mock.patch.object(gap_wheels.build_lab, "interpreter_problem", return_value="not a musl libc"):
+                self.assertEqual(gap_wheels.main(["install-test", "--staged", str(tmp), "--target", "3.14 musl-aarch64",
+                                                  "--out", str(tmp / "t2.json")]), 3)  # fmt: skip
 
 
 class Repair(unittest.TestCase):

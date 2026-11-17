@@ -29,8 +29,20 @@ for that package as one made from PyPI, plus ours (without PyPI's upload times, 
 uv's `exclude-newer` finds nothing for these packages here). Our wheel is marked yanked when PyPI yanks its release,
 and leaves the index when the release ships its own wheel for that platform or is gone from PyPI.
 
-Today that's Windows on ARM wheels for Python 3.14 and 3.14t. Linux is being worked on in
-[tracker#124](https://github.com/wheelgap/tracker/issues/124) and isn't published yet.
+The pipeline publishes wheels for these targets, each with exactly one tag:
+
+| Platform | Python | Tag |
+|---|---|---|
+| Windows on ARM | 3.14, 3.14t | `win_arm64` |
+| Windows x64 | 3.15 | `win_amd64` |
+| Linux x86_64, glibc 2.28 or newer | 3.14t, 3.15 | `manylinux_2_28_x86_64` |
+| Alpine Linux (musl) on ARM | 3.14 | `musllinux_1_2_aarch64` |
+
+The wheels published so far are Windows on ARM ones for Python 3.14 and 3.14t. Linux wheels are built and repaired
+with a pinned auditwheel in the pinned `manylinux_2_28` or Alpine image, and a Linux wheel goes up only if every
+library it needs is bundled in it or on that platform's standard list, as auditwheel's policy gives it. None is
+published until a maintainer approves a publish run that includes one
+([tracker#124](https://github.com/wheelgap/tracker/issues/124)).
 
 This repo holds only the pipeline that builds and publishes them, kept apart from
 [wheelgap](https://github.com/wheelgap/wheelgap) and [the tracker](https://github.com/wheelgap/tracker), which take
@@ -46,9 +58,15 @@ lots of outside contributions. Changes here are made by the maintainers, and eve
 3. **Verify:** a trusted job compares the two results. A pair counts only if both wheels are byte-identical and pip
    installs the wheel without compiling anything.
 4. **Stage:** the trusted job takes the wheel file from a build run only if its sha256 is the verified one, and only
-   for the one exact tag the target allows. The wheel can't need a DLL a user's machine may lack, and the release
-   must name an OSI-approved licence (or the PSF licence) on PyPI.
-5. **Install test:** each staged wheel is installed and imported on a fresh runner of its platform.
+   for the one exact tag the target allows. The wheel can't need a DLL a user's machine may lack (on Windows, read
+   from each `.pyd`/`.dll`'s imports) or, on Linux, a library that is neither bundled in the wheel nor on the
+   `manylinux_2_28` or `musllinux_1_2` list in auditwheel's policy, or a glibc symbol version newer than 2.28 (read
+   from each ELF file's dynamic section and version needs). The release must name an OSI-approved licence (or the PSF
+   licence) on PyPI. Staging only reads the files, never runs them.
+5. **Install test:** each staged wheel is installed and imported on a fresh runner of its platform. Linux wheels are
+   tested in a minimal container of their libc, pinned by digest, with the target's exact CPython (`python:3.14-alpine`,
+   `python:3.15-slim-trixie`, and `debian:trixie-slim` with a pinned, sha256-checked python-build-standalone 3.14t),
+   not on GitHub's runner image, which has many libraries a user's system doesn't.
 6. **Publish, after a maintainer approves:** the publish job waits on the `publish` environment's required reviewer.
    It then attests the files (`gh attestation verify FILE.whl -R wheelgap/wheels`), uploads them to the `gap-wheels`
    release, records them in `data/gap-wheels.json` and deploys the index.
@@ -65,6 +83,8 @@ lots of outside contributions. Changes here are made by the maintainers, and eve
 - **A build that tampers with what gets published.** The publish job never runs package code. It trusts only the
   staging job's own output for names and hashes, and re-hashes every file it uploads.
 - **Wrong-platform installs.** A wheel carries exactly one tag, the Python and platform it was built and tested on.
+  A Linux wheel's tag is auditwheel's repaired one, never `linux_*`, and staging checks again, from the wheel's own
+  ELF files, that the libraries and glibc symbol versions it needs are within that tag's policy.
 - **A PyPI answer that would change what an installer sees.** The PyPI part of each page is copied from PyPI's JSON
   simple API: only `https://files.pythonhosted.org/packages/` links with PyPI's sha256, and every field must have the
   shape the spec gives. If PyPI can't be read for any project, or anything is off, the hourly rebuild deploys nothing
