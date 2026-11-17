@@ -1033,7 +1033,7 @@ def missing_dlls(wheel: bytes) -> list[str] | None:
 
 ELF_NAME = re.compile(r"[A-Za-z0-9._+-]{1,255}", re.ASCII)  # a library or version name: it ends up in reason text
 ELF_SEARCH_PATH = re.compile(r"[A-Za-z0-9._+/${}:-]{0,4096}", re.ASCII)  # a DT_RUNPATH or DT_RPATH
-PAGE = 4096
+PAGES = {62: 4096, 183: 65536}  # the largest page a kernel uses: x86_64 has only 4 KiB, aarch64 can have 64 KiB
 
 
 def elf_needs(data: bytes, machine: int) -> tuple[set[str], set[str], list[str]] | None:
@@ -1086,11 +1086,12 @@ def elf_needs(data: bytes, machine: int) -> tuple[set[str], set[str], list[str]]
         # The loader maps each segment over what came before, so offset() below, which reads a vaddr from the one
         # segment holding it, is only right when no two segments share a page with different file offsets. The ELF
         # spec has them in ascending vaddr order; anything else is refused rather than guessed at.
+        page = PAGES.get(machine, 65536)
         for n, (va, filesz, off, memsz) in enumerate(loads):
             if memsz < filesz or (n and va < loads[n - 1][0]):
                 return None
             for va2, _, off2, memsz2 in loads[:n]:
-                overlap = va // PAGE * PAGE < -(-(va2 + memsz2) // PAGE) * PAGE
+                overlap = va // page * page < -(-(va2 + memsz2) // page) * page
                 if overlap and va - off != va2 - off2:
                     return None
 
@@ -1179,22 +1180,24 @@ SHARED_OBJECT = re.compile(r"[^/]*\.so(?:\.[0-9]+)*", re.ASCII)  # _ext.cpython-
 MAX_ELF_BYTES = 1_000_000_000  # read from one wheel's ELF files in all
 
 
-def installed(member: str) -> tuple[str, str]:
-    """Where a wheel member is installed: (scheme, path in it). purelib and platlib (<dist>.data/platlib/ or the wheel's
-    root) are one place; <dist>.data/data/, scripts/ and headers/ each another, which a RUNPATH can't reach."""
+def installed(member: str, data_dir: str) -> tuple[str, str]:
+    """Where a wheel member is installed: (scheme, path in it). `data_dir` is the wheel's one <name>-<version>.data
+    folder, the one pip reads (named after its .dist-info folder); any other top-level folder is installed as is.
+    purelib and platlib (data_dir/platlib/ or the wheel's root) are one place; data_dir/data/, scripts/ and headers/
+    each another, which a RUNPATH can't reach."""
     top, _, rest = member.partition("/")
-    if top.endswith(".data") and "/" in rest:
+    if top == data_dir and "/" in rest:
         scheme, _, path = rest.partition("/")
         return ("lib" if scheme in ("purelib", "platlib") else scheme), path
     return "lib", member
 
 
-def search_dirs(member: str, runpath: list[str]) -> list[tuple[str, str]]:
+def search_dirs(member: str, runpath: list[str], data_dir: str) -> list[tuple[str, str]]:
     """The installed folders in the wheel where glibc's loader finds a wheel ELF file's libraries: each RUNPATH (or
     RPATH) entry that is $ORIGIN or under it and stays inside its scheme. Not the file's own folder, which the loader
     doesn't search: a wheel that works only because the package preloads a library (with ctypes) isn't published.
     Other entries (/usr/lib, $LIB, a relative path) can't point into the wheel, so they don't count."""
-    scheme, path = installed(member)
+    scheme, path = installed(member, data_dir)
     here = posixpath.dirname(path)
     dirs = []
     for entry in runpath:
@@ -1218,11 +1221,16 @@ def missing_libs(wheel: bytes, plat: str) -> list[str] | None:
     the platform tag `plat` may not have: libraries that are neither on its policy's list (LINUX_POLICIES) nor in the
     wheel where the loader finds them from that file (search_dirs: auditwheel bundles them in <dist>.libs/ and points
     RUNPATH there with $ORIGIN), and for glibc symbol versions the policy doesn't allow (GLIBC_2.34 for manylinux_2_28). Empty when
-    it needs nothing else; None if a file can't be read (elf_needs) or there are too many or too much to check."""
+    it needs nothing else; None if a file can't be read (elf_needs), there are too many or too much to check, or the
+    wheel hasn't exactly one .dist-info folder (which names the .data folder pip installs from)."""
     policy = LINUX_POLICIES[plat]
     with zipfile.ZipFile(io.BytesIO(wheel)) as z:
         files = [i for i in z.infolist() if not i.is_dir()]
-        where = {installed(i.filename) for i in files}
+        dist_info = {i.filename.partition("/")[0] for i in files if i.filename.partition("/")[0].endswith(".dist-info")}
+        if len(dist_info) != 1:
+            return None
+        data_dir = dist_info.pop()[: -len(".dist-info")] + ".data"
+        where = {installed(i.filename, data_dir) for i in files}
         binaries = []
         for i in files:
             if SHARED_OBJECT.fullmatch(i.filename.rpartition("/")[2]):
@@ -1242,7 +1250,7 @@ def missing_libs(wheel: bytes, plat: str) -> list[str] | None:
                 return None
             budget -= len(data)
             libs, versions, runpath = needs
-            dirs = search_dirs(info.filename, runpath)
+            dirs = search_dirs(info.filename, runpath, data_dir)
             for lib in libs:
                 if lib not in policy["libs"] and not any((s, posixpath.join(d, lib)) in where for s, d in dirs):
                     missing.add(lib)

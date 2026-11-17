@@ -672,9 +672,9 @@ class Stage(unittest.TestCase):
         ext = elf(["libc.so.6", "libgomp-24e2ab19.so.1.0.0"], {"libc.so.6": ["GLIBC_2.2.5", "GLIBC_2.17"]},
                   runpath="$ORIGIN/../lz4.libs")
         lib = elf(["libc.so.6"], {"libc.so.6": ["GLIBC_2.28"]})
-        ok = zipped({"lz4/_block.cpython-314t-x86_64-linux-gnu.so": ext, "lz4.libs/libgomp-24e2ab19.so.1.0.0": lib})
-        new = zipped({"lz4/_block.cpython-314t-x86_64-linux-gnu.so": elf(["libc.so.6"], {"libc.so.6": ["GLIBC_2.34"]})})
-        musl = zipped({"lz4/_block.cpython-314-aarch64-linux-musl.so": elf(["libc.musl-aarch64.so.1"], machine=183)})
+        ok = whl({"lz4/_block.cpython-314t-x86_64-linux-gnu.so": ext, "lz4.libs/libgomp-24e2ab19.so.1.0.0": lib})
+        new = whl({"lz4/_block.cpython-314t-x86_64-linux-gnu.so": elf(["libc.so.6"], {"libc.so.6": ["GLIBC_2.34"]})})
+        musl = whl({"lz4/_block.cpython-314-aarch64-linux-musl.so": elf(["libc.musl-aarch64.so.1"], machine=183)})
         wheels = [verified(name="lz4", wheel=GLIBC_T, sha=hashlib.sha256(ok).hexdigest(), target="3.14t linux-x86_64"),
                   verified(name="zstandard", wheel="zstandard-0.14.0-cp314-cp314t-manylinux_2_28_x86_64.whl",
                            sha=hashlib.sha256(new).hexdigest(), target="3.14t linux-x86_64"),
@@ -1002,6 +1002,11 @@ def dyn_value(n):
 GLIBC_POLICY = "manylinux_2_28_x86_64"
 
 
+def whl(members, dist="pkg-1.0"):
+    """A wheel's bytes: the members, plus its one .dist-info folder."""
+    return zipped({**members, f"{dist}.dist-info/METADATA": b""})
+
+
 class Elf(unittest.TestCase):
     def test_reads_needed_libraries_symbol_versions_and_search_paths(self):
         data = elf(["libc.so.6", "libstdc++.so.6"], {"libc.so.6": ["GLIBC_2.2.5", "GLIBC_2.17"],
@@ -1087,6 +1092,10 @@ class Elf(unittest.TestCase):
     def test_segments_mapped_over_each_other_are_unreadable(self):
         self.assertIsNotNone(gap_wheels.elf_needs(elf(["libc.so.6"], loads=[(0, 0x20000, 0x40)]), 62))  # a page apart
         self.assertIsNotNone(gap_wheels.elf_needs(elf(["libc.so.6"], shift=0x10000), 62))
+        # Pages are 4 KiB on x86_64 but can be 64 KiB on aarch64: 4 KiB apart shares an aarch64 page.
+        self.assertIsNotNone(gap_wheels.elf_needs(elf(["libc.so.6"], shift=0x1000), 62))
+        self.assertIsNone(gap_wheels.elf_needs(elf(["libc.musl-aarch64.so.1"], machine=183, shift=0x1000), 183))
+        self.assertIsNotNone(gap_wheels.elf_needs(elf(["libc.musl-aarch64.so.1"], machine=183, shift=0x10000), 183))
         for label, data in (
             # The loader would map the headers' bytes over the tables' page; offset() would read the tables' bytes.
             ("over the tables, from other bytes", elf(["libc.so.6"], shift=0x1000, loads=[(0, 0x1000 + DYN_AT, 0x40)])),
@@ -1107,58 +1116,72 @@ class Elf(unittest.TestCase):
         allowed = elf(["libc.so.6", "libm.so.6", "libstdc++.so.6", "ld-linux-x86-64.so.2"],
                       {"libc.so.6": ["GLIBC_2.2.5", "GLIBC_2.28"], "libstdc++.so.6": ["GLIBCXX_3.4.24", "CXXABI_TM_1"],
                        "libgcc_s.so.1": ["GCC_7.0.0"], "ld-linux-x86-64.so.2": ["GLIBC_2.3"]})  # fmt: skip
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: allowed}), GLIBC_POLICY), [])
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: allowed}), GLIBC_POLICY), [])
         # auditwheel's layout: the extension's RUNPATH points at <dist>.libs, a bundled library's at its own folder.
         bundled = elf(["libc.so.6", "libgomp-24e2ab19.so.1.0.0"], runpath="$ORIGIN/../pkg.libs")
         gomp = elf(["libc.so.6", "libnuma-1a2b.so.1"], {"libc.so.6": ["GLIBC_2.17"], "libcrypto-abc.so.3": ["OPENSSL_3.0.0"]},
                    runpath="$ORIGIN")  # fmt: skip
         numa = elf(["libc.so.6"])
         libs = {"pkg.libs/libgomp-24e2ab19.so.1.0.0": gomp, "pkg.libs/libnuma-1a2b.so.1": numa}
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled, **libs}), GLIBC_POLICY), [])
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled}), GLIBC_POLICY), ["libgomp-24e2ab19.so.1.0.0"])
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: bundled, **libs}), GLIBC_POLICY), [])
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: bundled}), GLIBC_POLICY), ["libgomp-24e2ab19.so.1.0.0"])
         braced = elf(["libc.so.6", "libgomp-24e2ab19.so.1.0.0"], rpath="${ORIGIN}/../pkg.libs")
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: braced, **libs}), GLIBC_POLICY), [])
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: braced, **libs}), GLIBC_POLICY), [])
         # The bundled library has no RUNPATH: glibc doesn't look in its own folder, so its dependency isn't found.
         no_runpath = {**libs, "pkg.libs/libgomp-24e2ab19.so.1.0.0": elf(["libc.so.6", "libnuma-1a2b.so.1"])}
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled, **no_runpath}), GLIBC_POLICY),
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: bundled, **no_runpath}), GLIBC_POLICY),
                          ["libnuma-1a2b.so.1"])  # fmt: skip
         elsewhere = {"pkg.libs/libgomp-24e2ab19.so.1.0.0": elf(["libc.so.6", "libnuma-1a2b.so.1"]),
                      "other.libs/libnuma-1a2b.so.1": numa}  # fmt: skip
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: bundled, **elsewhere}), GLIBC_POLICY), ["libnuma-1a2b.so.1"])
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: bundled, **elsewhere}), GLIBC_POLICY), ["libnuma-1a2b.so.1"])
         # Without a RUNPATH a file of that name anywhere in the wheel doesn't count, even beside the extension: the
         # loader doesn't look there (a package preloading it with ctypes would work, but isn't published).
         plain = elf(["libc.so.6", "libfoo.so.1"])
         for where in ("pkg-1.0.data/data/lib/libfoo.so.1", "other/libfoo.so.1", "pkg.libs/libfoo.so.1", "pkg/libfoo.so.1"):
             with self.subTest(where):
-                self.assertEqual(gap_wheels.missing_libs(zipped({ext: plain, where: numa}), GLIBC_POLICY), ["libfoo.so.1"])
+                self.assertEqual(gap_wheels.missing_libs(whl({ext: plain, where: numa}), GLIBC_POLICY), ["libfoo.so.1"])
         beside = elf(["libc.so.6", "libfoo.so.1"], runpath="$ORIGIN")
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: beside, "pkg/libfoo.so.1": numa}), GLIBC_POLICY), [])
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: beside, "pkg/libfoo.so.1": numa}), GLIBC_POLICY), [])
         # A RUNPATH reaches only into the wheel: not above it, not into another install scheme, not by absolute path.
         for runpath, where in (("$ORIGIN/../..", "libfoo.so.1"), ("/usr/lib", "usr/lib/libfoo.so.1"),
                                ("$ORIGIN/../pkg-1.0.data/data/lib", "pkg-1.0.data/data/lib/libfoo.so.1"),
                                ("$LIB", "pkg/$LIB/libfoo.so.1"), ("lib", "pkg/lib/libfoo.so.1")):  # fmt: skip
             with self.subTest(runpath):
                 data = elf(["libc.so.6", "libfoo.so.1"], runpath=runpath)
-                self.assertEqual(gap_wheels.missing_libs(zipped({ext: data, where: numa}), GLIBC_POLICY), ["libfoo.so.1"])
+                self.assertEqual(gap_wheels.missing_libs(whl({ext: data, where: numa}), GLIBC_POLICY), ["libfoo.so.1"])
+        # Only the wheel's own <name>-<version>.data folder (its .dist-info's name) is installed by scheme: another
+        # folder ending in .data installs as it is, so a library in it isn't where $ORIGIN points.
+        at_root = elf(["libc.so.6", "libfoo.so.1"], runpath="$ORIGIN")
+        root = "_e.cpython-314t-x86_64-linux-gnu.so"
+        self.assertEqual(gap_wheels.missing_libs(whl({root: at_root, "pkg-1.0.data/platlib/libfoo.so.1": numa}),
+                                                 GLIBC_POLICY), [])  # fmt: skip
+        self.assertEqual(gap_wheels.missing_libs(whl({root: at_root, "bogus.data/platlib/libfoo.so.1": numa}),
+                                                 GLIBC_POLICY), ["libfoo.so.1"])  # fmt: skip
+        self.assertEqual(gap_wheels.missing_libs(whl({root: at_root, "other-1.0.data/platlib/libfoo.so.1": numa}),
+                                                 GLIBC_POLICY), ["libfoo.so.1"])  # fmt: skip
+        # Which .data folder pip reads is known only with exactly one .dist-info: otherwise the wheel is refused.
+        self.assertIsNone(gap_wheels.missing_libs(zipped({root: at_root}), GLIBC_POLICY))
+        two = zipped({root: at_root, "pkg-1.0.dist-info/METADATA": b"", "other-1.0.dist-info/METADATA": b""})
+        self.assertIsNone(gap_wheels.missing_libs(two, GLIBC_POLICY))
         # platlib under <dist>.data installs beside the root's files.
         inside = elf(["libc.so.6", "libfoo.so.1"], runpath="$ORIGIN/../pkg.libs")
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: inside, "pkg-1.0.data/platlib/pkg.libs/libfoo.so.1": numa}),
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: inside, "pkg-1.0.data/platlib/pkg.libs/libfoo.so.1": numa}),
                                                  GLIBC_POLICY), [])  # fmt: skip
         missing = elf(["libc.so.6", "libssl.so.3", "libpython3.14t.so.1.0"])
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: missing}), GLIBC_POLICY),
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: missing}), GLIBC_POLICY),
                          ["libpython3.14t.so.1.0", "libssl.so.3"])  # fmt: skip
         # Any ELF file, whatever its name, and a shared object, whatever's in it.
-        self.assertEqual(gap_wheels.missing_libs(zipped({"pkg-1.0.data/scripts/tool": missing}), GLIBC_POLICY),
+        self.assertEqual(gap_wheels.missing_libs(whl({"pkg-1.0.data/scripts/tool": missing}), GLIBC_POLICY),
                          ["libpython3.14t.so.1.0", "libssl.so.3"])  # fmt: skip
-        self.assertIsNone(gap_wheels.missing_libs(zipped({ext: b"not an elf"}), GLIBC_POLICY))
-        self.assertIsNone(gap_wheels.missing_libs(zipped({"pkg/libfoo.so.1": b"\x7fELF junk"}), GLIBC_POLICY))
-        self.assertEqual(gap_wheels.missing_libs(zipped({"pkg/data.bin": b"plain bytes", "pkg/__init__.py": b""}),
+        self.assertIsNone(gap_wheels.missing_libs(whl({ext: b"not an elf"}), GLIBC_POLICY))
+        self.assertIsNone(gap_wheels.missing_libs(whl({"pkg/libfoo.so.1": b"\x7fELF junk"}), GLIBC_POLICY))
+        self.assertEqual(gap_wheels.missing_libs(whl({"pkg/data.bin": b"plain bytes", "pkg/__init__.py": b""}),
                                                  GLIBC_POLICY), [])  # fmt: skip
-        many = zipped({f"pkg/m{i}.so": allowed for i in range(501)})
+        many = whl({f"pkg/m{i}.so": allowed for i in range(501)})
         self.assertIsNone(gap_wheels.missing_libs(many, GLIBC_POLICY))  # too many to check: refused, not half-checked
         with mock.patch.object(gap_wheels, "MAX_ELF_BYTES", 3 * len(allowed)):  # too much to read: refused too
-            self.assertEqual(gap_wheels.missing_libs(zipped({f"pkg/m{i}.so": allowed for i in range(3)}), GLIBC_POLICY), [])
-            self.assertIsNone(gap_wheels.missing_libs(zipped({f"pkg/m{i}.so": allowed for i in range(4)}), GLIBC_POLICY))
+            self.assertEqual(gap_wheels.missing_libs(whl({f"pkg/m{i}.so": allowed for i in range(3)}), GLIBC_POLICY), [])
+            self.assertIsNone(gap_wheels.missing_libs(whl({f"pkg/m{i}.so": allowed for i in range(4)}), GLIBC_POLICY))
 
     def test_glibc_symbol_versions_above_the_policy_are_refused(self):
         ext = "pkg/_ext.cpython-314t-x86_64-linux-gnu.so"
@@ -1178,23 +1201,23 @@ class Elf(unittest.TestCase):
         ):
             with self.subTest(needs):
                 data = elf(["libc.so.6", "libstdc++.so.6", "libgcc_s.so.1", "libz.so.1"], needs)
-                self.assertEqual(gap_wheels.missing_libs(zipped({ext: data}), GLIBC_POLICY), missing)
+                self.assertEqual(gap_wheels.missing_libs(whl({ext: data}), GLIBC_POLICY), missing)
 
     def test_musl_checks_libraries_only(self):
         ext = "pkg/_ext.cpython-314-aarch64-linux-musl.so"
         gcc = elf(["libc.musl-aarch64.so.1"], machine=183)
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: elf(["libc.musl-aarch64.so.1"], machine=183)}),
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: elf(["libc.musl-aarch64.so.1"], machine=183)}),
                                                  "musllinux_1_2_aarch64"), [])  # fmt: skip
         ok = elf(["libc.musl-aarch64.so.1", "libz.so.1", "libgcc_s-0366c7ba.so.1"], machine=183, runpath="$ORIGIN/../pkg.libs")
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: ok, "pkg.libs/libgcc_s-0366c7ba.so.1": gcc}),
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: ok, "pkg.libs/libgcc_s-0366c7ba.so.1": gcc}),
                                                  "musllinux_1_2_aarch64"), [])  # fmt: skip
         glibc = elf(["libc.so.6", "libstdc++.so.6"], machine=183)
-        self.assertEqual(gap_wheels.missing_libs(zipped({ext: glibc}), "musllinux_1_2_aarch64"),
+        self.assertEqual(gap_wheels.missing_libs(whl({ext: glibc}), "musllinux_1_2_aarch64"),
                          ["libc.so.6", "libstdc++.so.6"])  # fmt: skip
-        self.assertIsNone(gap_wheels.missing_libs(zipped({ext: elf(["libc.so.6"])}), "musllinux_1_2_aarch64"))  # x86_64
+        self.assertIsNone(gap_wheels.missing_libs(whl({ext: elf(["libc.so.6"])}), "musllinux_1_2_aarch64"))  # x86_64
 
     def test_stage_uses_the_targets_check(self):
-        data = zipped({"pkg/_ext.cpython-314t-x86_64-linux-gnu.so": elf(["libc.so.6", "libssl.so.3"])})
+        data = whl({"pkg/_ext.cpython-314t-x86_64-linux-gnu.so": elf(["libc.so.6", "libssl.so.3"])})
         wheel = verified(name="lz4", wheel=GLIBC_T, sha=hashlib.sha256(data).hexdigest(), target="3.14t linux-x86_64")
         with mock.patch.object(gap_wheels, "fetch_wheel", return_value=zipped({GLIBC_T: data})), \
              mock.patch.object(gap_wheels, "missing_dlls", side_effect=AssertionError("PE check on Linux")):  # fmt: skip

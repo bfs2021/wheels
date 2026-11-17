@@ -60,7 +60,7 @@ lots of outside contributions. Changes here are made by the maintainers, and eve
 4. **Stage:** the trusted job takes the wheel file from a build run only if its sha256 is the verified one, and only
    for the one exact tag the target allows. The wheel can't need a DLL a user's machine may lack (on Windows, read
    from each `.pyd`/`.dll`'s imports) or, on Linux, link against a library that is neither bundled in the wheel
-   (beside the file or on its `$ORIGIN` RUNPATH) nor on the `manylinux_2_28` or `musllinux_1_2` list in auditwheel's
+   (where its `$ORIGIN` RUNPATH or RPATH points) nor on the `manylinux_2_28` or `musllinux_1_2` list in auditwheel's
    policy, or need a glibc symbol version newer than 2.28 (read from each ELF file's dynamic section and version
    needs). Libraries a package loads by name at run time (`dlopen`) aren't checked. The release must name an
    OSI-approved licence (or the PSF licence) on PyPI. Staging only reads the files, never runs them.
