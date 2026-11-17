@@ -352,7 +352,7 @@ tokenizers = {{ index = "wheelgap" }}</code></pre>
         <li>Built from the source file PyPI has for that release. Its hash is checked against PyPI's. Build tools come from PyPI too.</li>
         <li>Built twice, in two separate GitHub Actions runs. It only goes up if the two builds come out byte for byte the same.</li>
         <li>Tagged for the one Python and platform it was built and tested on, nothing wider. It can't rely on a DLL your machine might not have.</li>
-        <li>On Linux, built in a pinned manylinux_2_28 or Alpine image and repaired there with a pinned auditwheel, which bundles the libraries it needs. It only goes up if every other library it needs is on that platform's standard list (and, for glibc, nothing newer than glibc 2.28), and it's install-tested in a minimal container, not on a build machine.</li>
+        <li>On Linux, built in a pinned manylinux_2_28 or Alpine image and repaired there with a pinned auditwheel, which bundles the libraries it needs. It only goes up if every other library it links against is on that platform's standard list (and, for glibc, nothing newer than glibc 2.28), and it's install-tested in a minimal container, not on a build machine.</li>
         <li>Installed and imported on a fresh machine before it goes up. On free-threaded Python the GIL has to stay off. This checks that it works, it's not a security check.</li>
         <li>pip checks each file's hash when it downloads it. You can also check where a file came from with <code>gh attestation verify FILE.whl -R wheelgap/wheels</code>.</li>
         <li>Every wheel, its source hash and both of its build runs are listed in <a href="data/gap-wheels.json">gap-wheels.json</a>.</li>

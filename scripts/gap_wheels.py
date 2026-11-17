@@ -47,6 +47,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -737,8 +738,10 @@ SYSTEM_DLL = re.compile(r"api-ms-win-[a-z0-9-]+\.dll|ext-ms-win-[a-z0-9-]+\.dll|
 # musllinux-policy.json ("musllinux_1_2", whose "libc.so" auditwheel reads as the arch's libc.musl-*.so.1), at
 # auditwheel 6.8.2, the version REPAIR_TOOLS pins. Bump them together. As in auditwheel, a symbol version whose prefix
 # the policy doesn't list (OPENSSL_3.0.0 from a bundled library) isn't checked, the dynamic loader (ld-linux-*) is
-# always there, and musl has no symbol versioning, so only its library list applies. Not re-checked here: auditwheel's
-# blacklist of zlib's internal symbols (the repair in the build refuses those).
+# always there, and musl has no symbol versioning, so only its library list applies. Stricter than auditwheel: the
+# versions a file needs from the loader are checked too (_dl_find_object@GLIBC_2.35 isn't in glibc 2.28). Not
+# re-checked here: auditwheel's blacklist of zlib's internal symbols (the repair in the build refuses those). This
+# covers the libraries a file links against, not ones its code dlopen()s by name at run time.
 LINUX_POLICIES: dict[str, dict] = {
     "manylinux_2_28_x86_64": {
         "machine": 62,  # EM_X86_64
@@ -1028,14 +1031,22 @@ def missing_dlls(wheel: bytes) -> list[str] | None:
     return sorted(missing)
 
 
-def elf_needs(data: bytes, machine: int) -> tuple[set[str], set[str]] | None:
-    """(the libraries a 64-bit little-endian ELF file for `machine` needs, its DT_NEEDED entries, and the symbol
-    versions it needs from them, from its version-needs table, .gnu.version_r: "GLIBC_2.17", "GLIBCXX_3.4.21"); None
-    if it can't be read. Read as the dynamic loader reads it, from the program headers and the dynamic segment, not
-    the section headers. Versions needed from the loader itself (ld-linux-*) are left out, as auditwheel does. A file
-    with no dynamic segment (statically linked, or an object file) needs nothing. Reads untrusted bytes, so every
-    offset is bounds-checked and anything odd is None (the wheel isn't published): another class, byte order or
-    machine, a table that runs off the file or its segment, a name that isn't ASCII."""
+ELF_NAME = re.compile(r"[A-Za-z0-9._+-]{1,255}", re.ASCII)  # a library or version name: it ends up in reason text
+ELF_SEARCH_PATH = re.compile(r"[A-Za-z0-9._+/${}:-]{0,4096}", re.ASCII)  # a DT_RUNPATH or DT_RPATH
+PAGE = 4096
+
+
+def elf_needs(data: bytes, machine: int) -> tuple[set[str], set[str], list[str]] | None:
+    """(the libraries a 64-bit little-endian ELF file for `machine` needs, its DT_NEEDED entries; the symbol versions
+    it needs from them, from its version-needs table, .gnu.version_r: "GLIBC_2.17", "GLIBCXX_3.4.21"; and the folders
+    the loader searches for them, its DT_RUNPATH, else its DT_RPATH, split at ":"), or None if it can't be read. Read
+    as glibc's loader reads it: from the program headers and the dynamic segment, not the section headers, following
+    the version-needs records' next links (as _dl_check_map_versions does) and requiring their counts to agree with
+    DT_VERNEEDNUM and each vn_cnt. Versions needed from the loader itself (ld-linux-*) count like any other: glibc
+    checks them too. A file with no dynamic segment (statically linked, or an object file) needs nothing. Reads
+    untrusted bytes, so every offset is bounds-checked and anything odd is None (the wheel isn't published): another
+    class, byte order or machine, loaded segments out of order or mapped over each other, a table that runs off the
+    file or its segment, a name outside [A-Za-z0-9._+-]."""
 
     def u16(o: int) -> int:
         if o < 0 or o + 2 > len(data):
@@ -1064,18 +1075,28 @@ def elf_needs(data: bytes, machine: int) -> tuple[set[str], set[str]] | None:
         for i in range(phnum):
             p = phoff + 56 * i
             kind = u32(p)
-            if kind == 1:  # PT_LOAD: (vaddr, size in the file, file offset)
-                loads.append((u64(p + 16), u64(p + 32), u64(p + 8)))
+            if kind == 1:  # PT_LOAD: (vaddr, size in the file, file offset, size in memory)
+                loads.append((u64(p + 16), u64(p + 32), u64(p + 8), u64(p + 40)))
             elif kind == 2:  # PT_DYNAMIC: (vaddr, size)
                 if dynamic is not None:
                     return None
                 dynamic = (u64(p + 16), u64(p + 32))
         if dynamic is None:
-            return set(), set()
+            return set(), set(), []
+        # The loader maps each segment over what came before, so offset() below, which reads a vaddr from the one
+        # segment holding it, is only right when no two segments share a page with different file offsets. The ELF
+        # spec has them in ascending vaddr order; anything else is refused rather than guessed at.
+        for n, (va, filesz, off, memsz) in enumerate(loads):
+            if memsz < filesz or (n and va < loads[n - 1][0]):
+                return None
+            for va2, _, off2, memsz2 in loads[:n]:
+                overlap = va // PAGE * PAGE < -(-(va2 + memsz2) // PAGE) * PAGE
+                if overlap and va - off != va2 - off2:
+                    return None
 
         def offset(vaddr: int, size: int) -> int:
             """The file offset of `size` bytes at `vaddr`, all inside one loaded segment's bytes in the file."""
-            for va, filesz, off in loads:
+            for va, filesz, off, _ in loads:
                 if va <= vaddr and vaddr + size <= va + filesz and off + (vaddr - va) + size <= len(data):
                     return off + (vaddr - va)
             raise ValueError
@@ -1090,70 +1111,118 @@ def elf_needs(data: bytes, machine: int) -> tuple[set[str], set[str]] | None:
                 break
             if tag == 1:  # DT_NEEDED
                 needed.append(value)
-            elif tag in (5, 10, 0x6FFFFFFE, 0x6FFFFFFF):  # DT_STRTAB, DT_STRSZ, DT_VERNEED, DT_VERNEEDNUM
+            elif tag in (5, 10, 15, 29, 0x6FFFFFFE, 0x6FFFFFFF):
+                # DT_STRTAB, DT_STRSZ, DT_RPATH, DT_RUNPATH, DT_VERNEED, DT_VERNEEDNUM
                 if tag in tags:
                     return None
                 tags[tag] = value
         else:
             return None  # no DT_NULL
         if not needed and 0x6FFFFFFE not in tags:
-            return set(), set()
+            return set(), set(), []
         if 5 not in tags or 10 not in tags:
             return None
         strsz = tags[10]
         strtab = offset(tags[5], strsz)
 
-        def string(o: int) -> str:
+        def string(o: int, pattern: re.Pattern[str] = ELF_NAME, limit: int = 256) -> str:
             if o >= strsz:
                 raise ValueError
-            end = data.find(b"\0", strtab + o, strtab + min(strsz, o + 256))
+            end = data.find(b"\0", strtab + o, strtab + min(strsz, o + limit))
             if end < 0:
                 raise ValueError
-            return data[strtab + o : end].decode("ascii")
+            text = data[strtab + o : end].decode("ascii")
+            if not pattern.fullmatch(text):
+                raise ValueError
+            return text
 
         versions: set[str] = set()
         if 0x6FFFFFFE in tags:
             count = tags.get(0x6FFFFFFF)
-            if count is None or count > 4096:
+            if count is None:
                 return None
-            v, seen = offset(tags[0x6FFFFFFE], 16), 0
-            for n in range(count):  # Elf64_Verneed: version, count, file, first aux, next (offsets from this one)
-                if u16(v) != 1:
+            # Elf64_Verneed: version, cnt, file, aux, next; Elf64_Vernaux: hash, flags, other, name, next. Both links
+            # are offsets from their own record in memory; the walk ends at a 0 link, as the loader's does.
+            v, files, seen = tags[0x6FFFFFFE], 0, 0
+            while True:
+                o = offset(v, 16)
+                files += 1
+                if u16(o) != 1 or files > count:
                     return None
-                aux_count, file, a, step = u16(v + 2), string(u32(v + 4)), v + u32(v + 8), u32(v + 12)
-                for m in range(aux_count):  # Elf64_Vernaux: hash, flags, other, name, next
+                string(u32(o + 4))  # the library's name must be readable too
+                a, auxes = v + u32(o + 8), 0
+                while True:
                     seen += 1
                     if seen > 10_000:
                         return None
-                    name = string(u32(a + 8))
-                    if not file.startswith("ld-linux"):
-                        versions.add(name)
-                    if m < aux_count - 1:
-                        if not u32(a + 12):
-                            return None
-                        a += u32(a + 12)
-                if n < count - 1:
-                    if not step:
-                        return None
-                    v += step
-        return {string(o) for o in needed}, versions
+                    ao = offset(a, 16)
+                    auxes += 1
+                    versions.add(string(u32(ao + 8)))
+                    if not u32(ao + 12):
+                        break
+                    a += u32(ao + 12)
+                if auxes != u16(o + 2):
+                    return None
+                if not u32(o + 12):
+                    break
+                v += u32(o + 12)
+            if files != count:
+                return None
+        search = tags.get(29, tags.get(15))  # DT_RUNPATH; DT_RPATH only when there's no DT_RUNPATH, as in glibc
+        runpath = string(search, ELF_SEARCH_PATH, 4097).split(":") if search is not None else []
+        return {string(o) for o in needed}, versions, [p for p in runpath if p]
     except (ValueError, UnicodeDecodeError):
         return None
 
 
 SHARED_OBJECT = re.compile(r"[^/]*\.so(?:\.[0-9]+)*", re.ASCII)  # _ext.cpython-314t-x86_64-linux-gnu.so, libz-1a2b.so.1
+MAX_ELF_BYTES = 1_000_000_000  # read from one wheel's ELF files in all
+
+
+def installed(member: str) -> tuple[str, str]:
+    """Where a wheel member is installed: (scheme, path in it). purelib and platlib (<dist>.data/platlib/ or the wheel's
+    root) are one place; <dist>.data/data/, scripts/ and headers/ each another, which a RUNPATH can't reach."""
+    top, _, rest = member.partition("/")
+    if top.endswith(".data") and "/" in rest:
+        scheme, _, path = rest.partition("/")
+        return ("lib" if scheme in ("purelib", "platlib") else scheme), path
+    return "lib", member
+
+
+def search_dirs(member: str, runpath: list[str]) -> list[tuple[str, str]]:
+    """The installed folders a wheel's ELF file finds its libraries in: its own folder (not where glibc looks, but a
+    package that loads its libraries first, with ctypes, works there, and the install test catches one that doesn't),
+    and each RUNPATH entry that is $ORIGIN or under it and stays inside its scheme. Other entries (/usr/lib, $LIB,
+    a relative path) can't point into the wheel, so they don't count."""
+    scheme, path = installed(member)
+    here = posixpath.dirname(path)
+    dirs = [(scheme, here)]
+    for entry in runpath:
+        for origin in ("$ORIGIN", "${ORIGIN}"):
+            if entry == origin or entry.startswith(origin + "/"):
+                rest = entry[len(origin) :]
+                break
+        else:
+            continue
+        if "$" in rest:
+            continue
+        folder = posixpath.normpath(posixpath.join(here, "." + rest)) if here else posixpath.normpath("." + rest)
+        if folder == ".." or folder.startswith("../"):
+            continue
+        dirs.append((scheme, "" if folder == "." else folder))
+    return dirs
 
 
 def missing_libs(wheel: bytes, plat: str) -> list[str] | None:
     """What the wheel's ELF files (every shared object, by name, and any other file that is ELF) need that a system of
-    the platform tag `plat` may not have: libraries that are neither on its policy's list (LINUX_POLICIES) nor a file
-    in the wheel (auditwheel bundles them in <dist>.libs/ and points RUNPATH there, so a name anywhere in the wheel
-    counts), and for glibc symbol versions the policy doesn't allow (GLIBC_2.34 for manylinux_2_28). Empty when it
-    needs nothing else; None if a file can't be read (elf_needs) or there are too many to check."""
+    the platform tag `plat` may not have: libraries that are neither on its policy's list (LINUX_POLICIES) nor in the
+    wheel where that file finds them (search_dirs: auditwheel bundles them in <dist>.libs/ and points RUNPATH there
+    with $ORIGIN), and for glibc symbol versions the policy doesn't allow (GLIBC_2.34 for manylinux_2_28). Empty when
+    it needs nothing else; None if a file can't be read (elf_needs) or there are too many or too much to check."""
     policy = LINUX_POLICIES[plat]
     with zipfile.ZipFile(io.BytesIO(wheel)) as z:
         files = [i for i in z.infolist() if not i.is_dir()]
-        names = {i.filename.rpartition("/")[2] for i in files}
+        where = {installed(i.filename) for i in files}
         binaries = []
         for i in files:
             if SHARED_OBJECT.fullmatch(i.filename.rpartition("/")[2]):
@@ -1165,13 +1234,18 @@ def missing_libs(wheel: bytes, plat: str) -> list[str] | None:
             if len(binaries) > 500:
                 return None
         missing: set[str] = set()
+        budget = MAX_ELF_BYTES
         for info in binaries:
-            data = bounded(z, info.filename, 200_000_000)
+            data = bounded(z, info.filename, min(200_000_000, budget))
             needs = elf_needs(data, policy["machine"]) if data is not None else None
             if needs is None:
                 return None
-            libs, versions = needs
-            missing |= {n for n in libs if n not in policy["libs"] and n not in names}
+            budget -= len(data)
+            libs, versions, runpath = needs
+            dirs = search_dirs(info.filename, runpath)
+            for lib in libs:
+                if lib not in policy["libs"] and not any((s, posixpath.join(d, lib)) in where for s, d in dirs):
+                    missing.add(lib)
             for v in versions:
                 prefix, _, version = v.partition("_")
                 if prefix in policy["versions"] and version not in policy["versions"][prefix]:
@@ -1360,22 +1434,23 @@ def cmd_install_test(args: argparse.Namespace) -> int:
 
 
 def read_tested(folder: Path) -> dict[str, dict[str, bool]]:
-    """By target: {wheel: passed} from the untrusted install-test artifacts (each tested-*/tested.json)."""
+    """By target: {wheel: passed} from the untrusted install-test artifacts. Each answer counts only for the target its
+    artifact is named for (tested-<slug>/tested.json, the slug of a lab target), whatever target its JSON names, so a
+    test job can't answer for another target by writing that target's name into its own artifact."""
+    slugs = {t.replace(" ", "-"): t for t in build_lab.TARGETS}
     out: dict[str, dict[str, bool]] = {}
-    paths = [*folder.glob("tested-*/tested.json"), *folder.glob("tested.json")] if folder.is_dir() else []
-    for path in sorted(paths):
-        if path.is_symlink() or path.stat().st_size > MAX_TESTED_BYTES:
+    paths = sorted(folder.glob("tested-*/tested.json")) if folder.is_dir() else []
+    for path in paths:
+        target = slugs.get(path.parent.name.removeprefix("tested-"))
+        if target is None or path.is_symlink() or path.parent.is_symlink() or path.stat().st_size > MAX_TESTED_BYTES:
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (UnicodeDecodeError, ValueError, RecursionError):
             continue
-        if not isinstance(data, dict) or not isinstance(data.get("tested"), dict) or data.get("target") not in build_lab.TARGETS:
+        if not isinstance(data, dict) or not isinstance(data.get("tested"), dict):
             continue
-        if data["target"] in out:  # two answers for one target: neither counts
-            out[data["target"]] = {}
-            continue
-        out[data["target"]] = {k: v for k, v in data["tested"].items() if isinstance(k, str) and v is True}
+        out[target] = {k: v for k, v in data["tested"].items() if isinstance(k, str) and v is True}
     return out
 
 
