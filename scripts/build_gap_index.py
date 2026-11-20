@@ -318,7 +318,7 @@ def read_requests(path: Path) -> dict[str, dict[str, str]]:
 
 def human_page(
     by_project: dict[str, list[dict]],
-    gone: dict[str, str] | None = None,
+    gone: dict[tuple[str, str], str] | None = None,
     requests: dict[str, dict[str, str]] | None = None,
 ) -> str:
     gone = gone or {}
@@ -347,7 +347,7 @@ def human_page(
             )
             install = (
                 f"<code>pip install --extra-index-url {e(INDEX_URL)} {e(project)}=={e(filename_version)}</code>"
-                if w["wheel"] not in gone and filename_version is not None
+                if (project, w["wheel"]) not in gone and filename_version is not None
                 else ""
             )
             rows.append(
@@ -357,7 +357,7 @@ def human_page(
                 f'<td><a href="{e(RELEASE_URL + w["wheel"])}" aria-label="wheel {e(w["wheel"])}">wheel</a>'
                 f'<br><small title="{e(w["sha256"])}">{e(w["sha256"][:12])}</small></td>'
                 f"<td>{install}</td>"
-                f"<td>{e(gone.get(w['wheel'], 'in the index'))}</td></tr>"
+                f"<td>{e(gone.get((project, w['wheel']), 'in the index'))}</td></tr>"
             )
     count = sum(len(v) for v in by_project.values()) - len(gone)
     # The heading's id has an underscore so no package row's id (a canonical name: a-z, 0-9 and -) can clash with it.
@@ -445,9 +445,11 @@ def build(
     wheels = data.get("wheels") if isinstance(data, dict) and isinstance(data.get("wheels"), list) else []
     by_project = projects(wheels)
     pages: dict[str, list[str]] = {}
-    gone: dict[str, str] = {}
-    status: dict[str, str] = {}
-    yanked: dict[str, str] = {}
+    # Keyed by (project, wheel file name): two projects can record the same file, and one project's state must
+    # not overwrite the other's (see #23).
+    gone: dict[tuple[str, str], str] = {}
+    status: dict[tuple[str, str], str] = {}
+    yanked: dict[tuple[str, str], str] = {}
     for project in by_project:
         try:
             files = [pypi_link(f) for f in fetch(project)]
@@ -457,8 +459,8 @@ def build(
                 return 1
             print(f"::warning::gap wheels: {project} left out of the index, PyPI's list can't be used: {exc}")
             for w in by_project[project]:
-                gone[w["wheel"]] = "left out for now: PyPI couldn't be read"
-                status[w["wheel"]] = "left-out-pypi-unreadable"
+                gone[(project, w["wheel"])] = "left out for now: PyPI couldn't be read"
+                status[(project, w["wheel"])] = "left-out-pypi-unreadable"
             continue
         listed = {name: link for name, link, _ in files}
         names_yanks = [(name, reason) for name, _, reason in files]
@@ -467,17 +469,18 @@ def build(
             mine = wheel_tags(w["wheel"])
             on_pypi, reason = release_yank(mine[1], project, names_yanks) if mine else (False, None)
             if not on_pypi:
-                gone[w["wheel"]] = "withdrawn: the release isn't on PyPI"
-                status[w["wheel"]] = "withdrawn-release-gone"
+                gone[(project, w["wheel"])] = "withdrawn: the release isn't on PyPI"
+                status[(project, w["wheel"])] = "withdrawn-release-gone"
             elif withdrawn(w["wheel"], set(listed)):
-                gone[w["wheel"]] = "withdrawn: PyPI has its own now"
-                status[w["wheel"]] = "withdrawn-pypi-has-wheel"
+                gone[(project, w["wheel"])] = "withdrawn: PyPI has its own now"
+                status[(project, w["wheel"])] = "withdrawn-pypi-has-wheel"
             else:
                 kept.append(w)
-                status[w["wheel"]] = "yanked" if reason is not None else "in-index"
+                status[(project, w["wheel"])] = "yanked" if reason is not None else "in-index"
                 if reason is not None:
-                    yanked[w["wheel"]] = reason
-        ours_links = dict(zip((w["wheel"] for w in kept), project_links(kept, yanked), strict=True))
+                    yanked[(project, w["wheel"])] = reason
+        project_yanked = {wheel: why for (p, wheel), why in yanked.items() if p == project}
+        ours_links = dict(zip((w["wheel"] for w in kept), project_links(kept, project_yanked), strict=True))
         pages[project] = [link for _, link in sorted({**listed, **ours_links}.items())]
     simple = site / "simple"
     simple.mkdir(parents=True, exist_ok=True)
@@ -504,8 +507,8 @@ def build(
                     "wheel": w["wheel"],
                     "sha256": w["sha256"],
                     "url": RELEASE_URL + w["wheel"],
-                    "status": status[w["wheel"]],
-                    "yank_reason": yanked.get(w["wheel"]),
+                    "status": status[(project, w["wheel"])],
+                    "yank_reason": yanked.get((project, w["wheel"])),
                 }
                 for project, records in by_project.items()
                 for w in records
@@ -514,10 +517,10 @@ def build(
         ),
     }
     (site / "data" / "status.json").write_text(json.dumps(wheel_status, indent=1) + "\n", encoding="utf-8")
-    listed_count = sum(1 for p in pages for w in by_project[p] if w["wheel"] not in gone)
+    listed_count = sum(1 for p in pages for w in by_project[p] if (p, w["wheel"]) not in gone)
     print(f"gap wheels: {listed_count} wheels of {len(pages)} projects listed, {len(gone)} withdrawn")
-    for name, why in sorted(gone.items()):
-        print(f"  {why}: {name}")
+    for (project, name), why in sorted(gone.items()):
+        print(f"  {why}: {project}: {name}")
     return 0
 
 

@@ -238,6 +238,40 @@ class Index(unittest.TestCase):
         row = page.split('<tr id="tiktoken">', 1)[1].split("</tr>", 1)[0]
         self.assertNotIn("pip install", row)
 
+    def test_the_same_file_recorded_twice_keeps_each_projects_state(self):
+        # tiktoken sorts before tiktokn, so tiktokn's withdrawal used to overwrite tiktoken's in-index state.
+        site = self.build([wheel(), wheel(name="tiktokn")])
+        status = json.loads((site / "data/status.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(w["project"], w["status"]) for w in status["wheels"]],
+            [("tiktoken", "in-index"), ("tiktokn", "withdrawn-release-gone")],
+        )
+        page = (site / "index.html").read_text(encoding="utf-8")
+        row = page.split('<tr id="tiktoken">', 1)[1].split("</tr>", 1)[0]
+        self.assertIn("in the index", row)
+        self.assertIn("tiktoken==0.14.0</code>", row)
+        project = (site / "simple/tiktoken/index.html").read_text(encoding="utf-8")
+        self.assertEqual(project.count("releases/download/gap-wheels/tiktoken-0.14.0-cp314-cp314-win_arm64.whl"), 1)
+
+    def test_one_projects_yank_reason_doesnt_leak_into_an_others_page(self):
+        # tiktok sorts before tiktoken, so tiktok's yank reason used to mark tiktoken's link data-yanked.
+        site = self.build(
+            [wheel(name="tiktok"), wheel()],
+            {"tiktok": [pypi_file("tiktok-0.14.0-cp314-cp314-win_arm64.whl", yanked="bad build")]},
+        )
+        status = json.loads((site / "data/status.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(w["project"], w["status"], w["yank_reason"]) for w in status["wheels"]],
+            [("tiktok", "yanked", "bad build"), ("tiktoken", "in-index", None)],
+        )
+        project = (site / "simple/tiktoken/index.html").read_text(encoding="utf-8")
+        self.assertEqual(project.count("releases/download/gap-wheels/tiktoken-0.14.0-cp314-cp314-win_arm64.whl"), 1)
+        self.assertNotIn("data-yanked", project)
+        page = (site / "index.html").read_text(encoding="utf-8")
+        row = page.split('<tr id="tiktoken">', 1)[1].split("</tr>", 1)[0]
+        self.assertIn("in the index", row)
+        self.assertIn("tiktoken==0.14.0</code>", row)
+
 
     def test_no_file_yet(self):
         tmp = Path(tempfile.mkdtemp())
